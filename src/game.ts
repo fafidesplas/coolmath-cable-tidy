@@ -13,6 +13,20 @@ const DAMP = 0.982;
 const ITER = 14;
 const SNAP_R = 44;
 const SLACK = 1.06;
+// Rest / sleeping (see README "Physics rest test")
+const LOW_V = 0.25; // px per substep: below this, extra "static friction" damping kills creep
+const LOW_DAMP = 0.8;
+const FLOOR_STATIC = 0.6; // px per substep: slower nodes touching the floor stick (static friction)
+const SLEEP_DIST = 3; // px: a cable whose nodes all stay within this of where they were...
+const SLEEP_FRAMES = 40; // ...for ~0.66 s is "still" and may go to sleep (frozen, zero cost)
+// Safety net: the longer nobody touches anything, the larger that tolerance gets (up to 4x after
+// ~9 s), so even a slowly collapsing heap is guaranteed to come to rest.
+const SLEEP_GROW_FRAMES = 180;
+const SLEEP_GROW_MAX = 4;
+const WAKE_V = 0.5; // px per frame: an awake node this fast touching a sleeping cable wakes it
+const CAB_STATIC = 0.5; // px per substep: slower relative slides between touching cables stick
+const CAB_KINETIC = 0.3; // fraction of a faster relative slide removed per contact pass
+const MAX_UNTWISTS = 3; // auto curl fixes per cable between player interactions
 const GC = 40; // grid cols (cell 18px)
 const GR = 50;
 const CELL = 18;
@@ -60,6 +74,10 @@ export class Cable {
   x!: Float32Array; y!: Float32Array; px!: Float32Array; py!: Float32Array;
   pin: Uint8Array;
   ends: [End, End];
+  /** frames in a row this cable has stayed within SLEEP_DIST of its rest anchor */
+  still = 0;
+  /** automatic curl fixes since the player last interacted (capped so it can't loop forever) */
+  untwists = 0;
   constructor(public id: number, public color: ColorKey, public length: number, offset: number) {
     const segs = Math.max(8, Math.round(length / SEG));
     this.n = segs + 1;
@@ -103,11 +121,19 @@ export class Game {
   allGood = false;
   time = 0;
   private frame = 0;
+  /** frames since the player last touched anything */
+  private idleFrames = 0;
   pointer = { x: -999, y: -999 };
   onEvent: (e: GameEvent) => void = () => {};
 
   private X: Float32Array; private Y: Float32Array; private PX: Float32Array; private PY: Float32Array;
   private PIN: Uint8Array;
+  private FX: Float32Array; private FY: Float32Array; // positions at frame start
+  private AX: Float32Array; private AY: Float32Array; // rest anchor (positions when `still` restarted)
+  /** per cable: 1 = asleep (frozen until something touches/grabs/plugs it) */
+  readonly sleep: Uint8Array;
+  /** union-find over cables touching each other / sharing a tie this frame (sleep islands) */
+  private uf: Int16Array;
   private ptC: Int16Array; private ptI: Int16Array;
   private grid = new Int32Array(GC * GR);
   private next: Int32Array;
@@ -139,6 +165,10 @@ export class Game {
     this.X = new Float32Array(off); this.Y = new Float32Array(off);
     this.PX = new Float32Array(off); this.PY = new Float32Array(off);
     this.PIN = new Uint8Array(off);
+    this.FX = new Float32Array(off); this.FY = new Float32Array(off);
+    this.AX = new Float32Array(off); this.AY = new Float32Array(off);
+    this.sleep = new Uint8Array(this.cables.length);
+    this.uf = new Int16Array(this.cables.length);
     this.ptC = new Int16Array(off); this.ptI = new Int16Array(off);
     this.next = new Int32Array(off);
     for (const c of this.cables) {
@@ -152,6 +182,7 @@ export class Game {
     this.order = [...this.cables];
     this.scramble();
     for (let i = 0; i < 320; i++) this.step(1 / 60, true);
+    this.wakeAll(); // the player sees the settled tangle; let it finish settling live
     this.fx = [];
     for (const p of this.ports) p.pulse = 0;
   }
@@ -223,6 +254,10 @@ export class Game {
     for (const f of this.fx) f.t += dt;
     this.fx = this.fx.filter((f) => f.t < 0.8);
     const sub = 2, h = dt / sub;
+    this.FX.set(this.X); this.FY.set(this.Y);
+    for (let i = 0; i < this.uf.length; i++) this.uf[i] = i;
+    for (const t of this.ties) for (const e of t.entries) this.union(t.entries[0].cable.id, e.cable.id);
+    this.forceWake();
     for (let s = 0; s < sub; s++) {
       this.computePins();
       this.integrate(h);
@@ -236,26 +271,140 @@ export class Game {
     }
     void silent;
     if (++this.frame % 12 === 0) this.untwist();
+    this.wakeByContact();
+    this.updateSleep();
   }
 
-  /** Small curls (self-loops spanning few segments) relax out, like a real cable twisting free. */
+  // ---------------------------------------------------------------- sleeping
+  isAsleep(c: Cable) { return this.sleep[c.id] === 1; }
+
+  wake(c: Cable) { this.sleep[c.id] = 0; c.still = 0; }
+
+  private find(a: number): number {
+    const uf = this.uf;
+    while (uf[a] !== a) { uf[a] = uf[uf[a]]; a = uf[a]; }
+    return a;
+  }
+  private union(a: number, b: number) { const ra = this.find(a), rb = this.find(b); if (ra !== rb) this.uf[ra] = rb; }
+
+  /** Wake a cable together with every cable in its contact island. */
+  private wakeIsland(c: Cable) {
+    const r = this.find(c.id);
+    for (const o of this.cables) if (this.find(o.id) === r) this.wake(o);
+  }
+
+  /** Player-driven change (grab, plug, tie...): wake everything and re-arm auto-untwist. */
+  wakeAll() { this.idleFrames = 0; for (const c of this.cables) { this.wake(c); c.untwists = 0; } }
+
+  /** Anything the player is touching (or a tie still closing) must simulate. */
+  private forceWake() {
+    const g = this.grab;
+    if (g?.cable) this.wake(g.cable);
+    if (g?.end) this.wake(g.end.cable);
+    for (const t of this.ties) {
+      if (t.t < 1 || g?.tie === t) for (const e of t.entries) this.wake(e.cable);
+    }
+  }
+
+  /**
+   * Wake sleeping cables that an awake node is really pushing into: the node must have moved
+   * more than WAKE_V over the whole frame. (Checking inside the solver woke cables from the
+   * gravity step of resting neighbours, which then kept waking each other forever.)
+   */
+  private wakeByContact() {
+    const { X, Y, FX, FY, ptC, sleep, grid, next } = this;
+    if (!sleep.some((v) => v === 1)) return;
+    const R2 = (REP_R + 4) * (REP_R + 4), V2 = WAKE_V * WAKE_V;
+    for (let k = 0; k < this.total; k++) {
+      if (sleep[ptC[k]]) continue;
+      const vx = X[k] - FX[k], vy = Y[k] - FY[k];
+      if (vx * vx + vy * vy < V2) continue;
+      const cx = Math.min(GC - 1, Math.max(0, (X[k] / CELL) | 0));
+      const cy = Math.min(GR - 1, Math.max(0, (Y[k] / CELL) | 0));
+      for (let oy = -1; oy <= 1; oy++) {
+        const yy = cy + oy;
+        if (yy < 0 || yy >= GR) continue;
+        for (let ox = -1; ox <= 1; ox++) {
+          const xx = cx + ox;
+          if (xx < 0 || xx >= GC) continue;
+          for (let j = grid[xx + yy * GC]; j !== -1; j = next[j]) {
+            if (!sleep[ptC[j]]) continue;
+            const dx = X[j] - X[k], dy = Y[j] - Y[k];
+            if (dx * dx + dy * dy < R2) this.wakeIsland(this.cables[ptC[j]]);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * A cable whose every node stayed within SLEEP_DIST of its anchor for SLEEP_FRAMES is "still".
+   * Cables go to sleep per contact island, all at once, and only when the whole island is
+   * still: putting one cable to sleep while a neighbour resting on it stays awake changes the
+   * neighbour's contact response (it suddenly collides with a static body), which jolted it
+   * and woke the sleeper again — another endless jitter loop.
+   */
+  private updateSleep() {
+    const { X, Y, AX, AY, PX, PY } = this;
+    const n = this.cables.length;
+    if (this.grab) this.idleFrames = 0; else this.idleFrames++;
+    const tol = SLEEP_DIST * Math.min(SLEEP_GROW_MAX, 1 + this.idleFrames / SLEEP_GROW_FRAMES);
+    const blocked = new Uint8Array(n); // island root -> 1 if some member can't sleep
+    for (const c of this.cables) {
+      if (this.sleep[c.id]) continue;
+      // Distance from a rest anchor rather than per-frame speed: tiny stick-slip creeps on the
+      // floor (0.07 px every half second) would otherwise reset the counter forever.
+      let m = Infinity;
+      if (c.still > 0 && !this.isGrabbed(c)) {
+        m = 0;
+        for (let k = c.o; k < c.o + c.n; k++) {
+          const dx = X[k] - AX[k], dy = Y[k] - AY[k];
+          m = Math.max(m, dx * dx + dy * dy);
+        }
+      }
+      if (m < tol * tol) c.still++;
+      else {
+        c.still = this.isGrabbed(c) ? 0 : 1;
+        AX.set(X.subarray(c.o, c.o + c.n), c.o); AY.set(Y.subarray(c.o, c.o + c.n), c.o);
+      }
+      if (c.still < SLEEP_FRAMES) blocked[this.find(c.id)] = 1;
+    }
+    for (const c of this.cables) {
+      if (this.sleep[c.id] || blocked[this.find(c.id)]) continue;
+      this.sleep[c.id] = 1;
+      for (let k = c.o; k < c.o + c.n; k++) { PX[k] = X[k]; PY[k] = Y[k]; }
+    }
+  }
+
+  /**
+   * Small curls (self-loops spanning few segments) relax out, like a real cable twisting free.
+   * The crossing is removed with a "2-opt" swap: the node order between the two crossing
+   * segments is reversed, so the loop becomes a hairpin WITHOUT moving any node. (The old
+   * version teleported the loop's nodes onto a straight chord shorter than the loop; the
+   * distance constraints then pushed them back out into a new curl, and the cycle repeated
+   * every 12 frames forever — the "dancing cable" bug.) A cable with spare length lying on
+   * the floor can legitimately buckle over itself again, so the number of automatic fixes is
+   * capped per cable until the player touches something; after that it is allowed to rest.
+   */
   private untwist() {
     for (const c of this.cables) {
-      if (this.isGrabbed(c)) continue;
-      const { x, y } = c;
+      if (this.isGrabbed(c) || this.sleep[c.id] || c.untwists >= MAX_UNTWISTS) continue;
+      const { x, y, px, py } = c;
       for (let i = 1; i < c.n - 4; i++) {
         for (let j = i + 3; j < Math.min(c.n - 2, i + 26); j++) {
           if (!segX(x[i], y[i], x[i + 1], y[i + 1], x[j], y[j], x[j + 1], y[j + 1])) continue;
-          // straighten i+1..j between i and j+1
-          let lo = i, hi = j + 1;
-          if (c.pin[lo + 1]) continue;
-          for (let k = lo + 1; k < hi; k++) {
-            if (c.pin[k]) continue;
-            const t = (k - lo) / (hi - lo);
-            const nx = x[lo] + (x[hi] - x[lo]) * t, ny = y[lo] + (y[hi] - y[lo]) * t;
-            c.px[k] = x[k] = nx + Math.sin(t * Math.PI) * 3;
-            c.py[k] = y[k] = ny;
+          let blocked = false;
+          for (let k = i + 1; k <= j && !blocked; k++) blocked = !!c.pin[k];
+          if (!blocked) blocked = this.ties.some((t) => t.entries.some((e) => e.cable === c && e.idx > i && e.idx <= j));
+          if (blocked) continue;
+          for (let a = i + 1, b = j; a < b; a++, b--) {
+            let t = x[a]; x[a] = x[b]; x[b] = t;
+            t = y[a]; y[a] = y[b]; y[b] = t;
+            t = px[a]; px[a] = px[b]; px[b] = t;
+            t = py[a]; py[a] = py[b]; py[b] = t;
           }
+          this.wakeIsland(c);
+          c.untwists++;
           i = j;
           break;
         }
@@ -277,13 +426,15 @@ export class Game {
   }
 
   private integrate(h: number) {
-    const { X, Y, PX, PY, PIN } = this;
+    const { X, Y, PX, PY, PIN, ptC, sleep } = this;
     const g = GRAV * h * h;
     const MAXV = 30;
     for (let k = 0; k < this.total; k++) {
-      if (PIN[k]) { PX[k] = X[k]; PY[k] = Y[k]; continue; }
-      let vx = (X[k] - PX[k]) * DAMP, vy = (Y[k] - PY[k]) * DAMP;
+      if (PIN[k] || sleep[ptC[k]]) { PX[k] = X[k]; PY[k] = Y[k]; continue; }
+      let vx = X[k] - PX[k], vy = Y[k] - PY[k];
       const v = Math.hypot(vx, vy);
+      const damp = v < LOW_V ? LOW_DAMP : DAMP;
+      vx *= damp; vy *= damp;
       if (v > MAXV) { vx *= MAXV / v; vy *= MAXV / v; }
       PX[k] = X[k]; PY[k] = Y[k];
       X[k] += vx; Y[k] += vy + g;
@@ -292,6 +443,7 @@ export class Game {
 
   private solveDist() {
     for (const c of this.cables) {
+      if (this.sleep[c.id]) continue;
       const { x, y, pin, seg } = c;
       for (let i = 0; i < c.n - 1; i++) {
         const dx = x[i + 1] - x[i], dy = y[i + 1] - y[i];
@@ -308,6 +460,7 @@ export class Game {
 
   private solveBend() {
     for (const c of this.cables) {
+      if (this.sleep[c.id]) continue;
       const { x, y, pin } = c;
       const min = c.seg * 1.82;
       for (let i = 0; i < c.n - 2; i++) {
@@ -325,7 +478,7 @@ export class Game {
   }
 
   private repel() {
-    const { X, Y, PIN, grid, next, ptC, ptI } = this;
+    const { X, Y, PX, PY, PIN, grid, next, ptC, sleep } = this;
     grid.fill(-1);
     for (let k = 0; k < this.total; k++) {
       const cx = Math.min(GC - 1, Math.max(0, (X[k] / CELL) | 0));
@@ -350,13 +503,29 @@ export class Game {
             const dx = X[j] - X[k], dy = Y[j] - Y[k];
             const d2 = dx * dx + dy * dy;
             if (d2 >= R2 || d2 < 1e-6) continue;
-            const w1 = PIN[k] ? 0 : 1, w2 = PIN[j] ? 0 : 1;
+            this.union(ptC[k], ptC[j]);
+            const sk = sleep[ptC[k]], sj = sleep[ptC[j]];
+            if (sk && sj) continue;
+            // sleeping cables act as static colliders (weight 0); see wakeByContact()
+            const w1 = PIN[k] || sleep[ptC[k]] ? 0 : 1, w2 = PIN[j] || sleep[ptC[j]] ? 0 : 1;
             const ws = w1 + w2;
             if (!ws) continue;
             const d = Math.sqrt(d2);
             const f = ((REP_R - d) / d) * 0.55 / ws;
             X[k] -= dx * f * w1; Y[k] -= dy * f * w1;
             X[j] += dx * f * w2; Y[j] += dy * f * w2;
+            // contact friction: remove (part of) the relative tangential slide this substep, so a
+            // cable draped over another one comes to rest instead of creeping off it for seconds
+            const nx = dx / d, ny = dy / d;
+            const rx = (X[j] - PX[j]) - (X[k] - PX[k]), ry = (Y[j] - PY[j]) - (Y[k] - PY[k]);
+            const rn = rx * nx + ry * ny;
+            const tx = rx - rn * nx, ty = ry - rn * ny;
+            const tl = Math.hypot(tx, ty);
+            if (tl > 1e-6) {
+              const c = (tl < CAB_STATIC ? 1 : CAB_KINETIC) / ws;
+              X[k] += tx * c * w1; Y[k] += ty * c * w1;
+              X[j] -= tx * c * w2; Y[j] -= ty * c * w2;
+            }
           }
         }
       }
@@ -392,11 +561,21 @@ export class Game {
   }
 
   private bounds() {
-    const { X, Y, PX } = this;
+    const { X, Y, PX, PIN, ptC, sleep } = this;
     for (let k = 0; k < this.total; k++) {
+      if (sleep[ptC[k]]) continue;
       if (X[k] < 6) X[k] = 6; else if (X[k] > W - 6) X[k] = W - 6;
       if (Y[k] < 6) Y[k] = 6;
-      else if (Y[k] >= FLOOR) { Y[k] = FLOOR; PX[k] = X[k] - (X[k] - PX[k]) * 0.4; }
+      else if (Y[k] >= FLOOR) {
+        Y[k] = FLOOR;
+        const vx = X[k] - PX[k];
+        // Position-based friction. Static: a node resting on the floor that would slide less than
+        // FLOOR_STATIC this substep is put back where it was (stops slow creep / rolling coils that
+        // the constraint projection would otherwise push along forever). Kinetic: keep 40% of a slide.
+        if (PIN[k]) continue; // the grabbed node always follows the pointer
+        if (Math.abs(vx) < FLOOR_STATIC) X[k] = PX[k];
+        else PX[k] = X[k] - vx * 0.4;
+      }
     }
   }
 
@@ -432,6 +611,7 @@ export class Game {
   pointerDown(x: number, y: number, tieMode: boolean): boolean {
     this.pointer = { x, y };
     if (tieMode) { this.placeTie(x, y); return false; }
+    this.wakeAll();
     // plugs
     let bestE: End | null = null, bd = 34;
     for (const c of this.cables) for (const e of c.ends) {
@@ -498,6 +678,7 @@ export class Game {
     const g = this.grab;
     this.grab = null;
     if (!g) return;
+    this.wakeAll();
     if (g.kind === 'plug' && g.end && this.hoverPort) {
       const p = this.hoverPort, e = g.end;
       p.end = e; e.port = p; p.pulse = 1;
@@ -583,6 +764,7 @@ export class Game {
     };
     this.ties.push(tie);
     this.tiesLeft--;
+    this.wakeAll();
     this.fx.push({ x: cx, y: cy, t: 0, color: '#ffffff', kind: 'ring' });
     this.onEvent({ type: 'tie' });
     return true;
@@ -683,6 +865,7 @@ export class Game {
       const a = this.ports.find((p) => p.side === 'A' && p.color === c.color && !used.has(p))!;
       const b = this.ports.find((p) => p.side === 'B' && p.color === c.color && !used.has(p))!;
       used.add(a); used.add(b);
+      this.wake(c);
       a.end = c.ends[0]; c.ends[0].port = a;
       b.end = c.ends[1]; c.ends[1].port = b;
       const pa = portAnchor(a), pb = portAnchor(b);

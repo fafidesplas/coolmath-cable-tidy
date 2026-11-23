@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:physics": "node scripts/run-ts.mjs tests/physics.test.ts"
   },
   "devDependencies": {
     "typescript": "~5.9.3",

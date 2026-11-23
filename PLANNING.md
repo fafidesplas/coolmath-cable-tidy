@@ -49,6 +49,12 @@ Read client brief → Untangle & connect (LEDs go green) → Tidy (ties, smooth 
 - Cables softly repel *other* cables (spatial hash grid), so dragging one snags and pushes its neighbours — they hook, slide and cross like the real thing.
 - Small self-curls relax out automatically (a real cable twists free), but large tangles must be undone by the player.
 - Plugged ends pin two points so the cable leaves the port straight.
+- **Coming to rest (fix, Nov 2026).** Players reported a loose cable that "danced" forever. Cause: the curl remover teleported a loop's nodes onto a straight chord *shorter* than the loop every 12 frames; the distance constraints pushed them back out into a new curl, and so on forever (jumps of 60–140 px/frame). Secondary causes: no sleeping, floor friction that never fully stopped a slide, and a constraint-driven creep of coils/piles. Fix:
+  - Curl removal is now a 2-opt swap (reverse the node order between the two crossing segments: no node moves), capped at 3 automatic fixes per cable until the player touches something.
+  - Position-based friction: static + kinetic on the floor, and between touching cables.
+  - Extra damping below 0.25 px/substep so slow creep dies out; normal damping when moving (drag feel unchanged).
+  - Island sleeping: cables that touch or share a tie sleep together once every node stayed within 3 px for 40 frames (tolerance grows slowly after ~3 s without input). Sleeping cables are frozen static colliders; they wake when grabbed, when anything is plugged/unplugged/tied, when a curl fix touches them, or when an awake node moving > 0.5 px/frame touches them (checked at frame end, not mid-solver).
+  - Regression test: `npm run test:physics` (see README).
 
 ### 4.2 Plugs & ports
 - Grab a plug (generous 34 px radius for fingers) — if it was plugged, it pops out with an *unplug* sound.
@@ -126,6 +132,7 @@ Single-pointer input (extra fingers ignored) to avoid accidental multi-touch cha
 - **Persistence:** stars + mute in `localStorage`.
 - **Deploy:** GitHub Actions → GitHub Pages (`base: /coolmath-cable-tidy/`).
 - **Test hook:** `window.__cable` exposes plug/port positions and the evaluation, used by automated Playwright play-throughs.
+- **Physics test:** `npm run test:physics` runs the real simulation headless on every job (start, solved, drag, tie, random drags) and asserts all cables come to rest.
 
 ## 9. Milestones
 | Milestone | Content | Status |
