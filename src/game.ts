@@ -41,7 +41,7 @@ export interface Port {
 export interface TieEntry { cable: Cable; idx: number; off: number }
 export interface Tie { x: number; y: number; nx: number; ny: number; color: ColorKey; entries: TieEntry[]; t: number }
 
-export interface Fx { x: number; y: number; t: number; color: string; kind: 'ring' | 'spark' }
+export interface Fx { x: number; y: number; t: number; color: string; kind: 'ring' | 'spark'; glyph?: 'ok' | 'bad' }
 
 interface Grab {
   kind: 'plug' | 'cable' | 'tie';
@@ -689,7 +689,7 @@ export class Game {
       c.x[j] = c.px[j] = b.x; c.y[j] = c.py[j] = b.y;
       const colorMatch = p.color === c.color;
       const done = c.valid();
-      this.fx.push({ x: p.x, y: p.y, t: 0, color: colorMatch ? '#7dffb0' : '#ff8a8a', kind: 'ring' });
+      this.fx.push({ x: p.x, y: p.y, t: 0, color: colorMatch ? '#7dffb0' : '#ff8a8a', kind: 'ring', glyph: colorMatch ? 'ok' : 'bad' });
       if (done) this.fx.push({ x: p.x, y: p.y, t: 0, color: '#fff3a8', kind: 'spark' });
       this.onEvent({ type: 'snap', colorMatch, cableDone: done });
       this.refreshAll();

@@ -1,6 +1,7 @@
 import './style.css';
 import { Game, W, H, Evaluation, GameEvent } from './game';
-import { LEVELS } from './levels';
+import { LEVELS, COLORS, type ColorKey } from './levels';
+import { badgeSvg } from './symbols';
 import { drawScene } from './render';
 import * as sfx from './audio';
 
@@ -77,6 +78,7 @@ function updateHud() {
   const n = game.connectedCount(), t = game.cables.length;
   const conn = $('conn');
   conn.textContent = `${n}/${t}`;
+  conn.title = n === t ? 'All connections working' : 'Some connections not working yet';
   conn.classList.toggle('ok', n === t);
   $('tie-count').textContent = String(game.tiesLeft);
   btnFinish.disabled = !game.allGood;
@@ -109,14 +111,15 @@ function titleScreen() {
   showOverlay(`
     <div class="card title-card">
       <svg class="logo-cables" viewBox="0 0 300 90">
-        <path d="M10 20 C 90 20, 110 70, 290 70" stroke="#2f7bf5"/>
-        <path d="M10 45 C 100 45, 120 45, 290 45" stroke="#f5c518" style="animation-delay:.2s"/>
-        <path d="M10 70 C 90 70, 110 20, 290 20" stroke="#25b158" style="animation-delay:.4s"/>
+        <path d="M10 20 C 90 20, 110 70, 290 70" stroke="${COLORS.blue.base}"/>
+        <path d="M10 45 C 100 45, 120 45, 290 45" stroke="${COLORS.yellow.base}" style="animation-delay:.2s"/>
+        <path d="M10 70 C 90 70, 110 20, 290 20" stroke="${COLORS.orange.base}" style="animation-delay:.4s"/>
       </svg>
       <div class="logo"><span>Cable</span> <span>Calm</span></div>
       <p class="tagline">Untangle. Click. Zip. Breathe.<br/>A cozy job simulator for cable tidiers.</p>
       <div class="row"><button class="btn green" id="go-play">Play</button></div>
       <p style="font-size:12px;opacity:.55;margin-top:14px">Drag plugs into matching ports · tie same colors · light every LED</p>
+      <p class="a11y-note">Colorblind-friendly: every color also has its own symbol ${(Object.keys(COLORS) as ColorKey[]).map((k) => badgeSvg(k, 18)).join('')}</p>
     </div>`);
   $('go-play').onclick = () => { sfx.unlockAudio(); sfx.sfxUi(); levelSelect(); };
 }
@@ -156,6 +159,7 @@ function startLevel(i: number) {
         <div class="bubble"><div class="who">${L.client}</div><div class="role">${L.clientRole}</div>${L.message}</div>
       </div>
       <ul class="goals">${L.goals.map((g) => `<li>${g}</li>`).join('')}</ul>
+      ${legendHtml(L.ports.map((p) => p.color))}
       <div class="row"><button class="btn alt" id="b-back">Job board</button><button class="btn green" id="b-start">Start job</button></div>
     </div>`);
   $('b-back').onclick = () => { sfx.sfxUi(); levelSelect(); };
@@ -166,6 +170,15 @@ function startLevel(i: number) {
     if (L.ties > 0 && i === 1) btnTie.classList.add('flash');
     setTimeout(() => btnTie.classList.remove('flash'), 3000);
   };
+}
+
+/** Legend chips: colour + symbol + name + how many cables of it the job has. */
+function legendHtml(portColors: ColorKey[]) {
+  const counts = new Map<ColorKey, number>();
+  for (const c of portColors) counts.set(c, (counts.get(c) ?? 0) + 1);
+  const chips = [...counts].map(([c, n]) =>
+    `<span class="chip">${badgeSvg(c)}<span>${COLORS[c].name}</span><small>×${n / 2}</small></span>`).join('');
+  return `<div class="legend" aria-label="Cable colors in this job">${chips}</div>`;
 }
 
 function snapshot(g: Game): string {
@@ -268,7 +281,7 @@ function onGameEvent(e: GameEvent) {
     case 'snap':
       sfx.sfxSnap(e.colorMatch, e.cableDone);
       sfx.buzz(e.colorMatch ? (e.cableDone ? [18, 40, 25] : 18) : [10, 30, 10]);
-      if (!e.colorMatch) toast('Wrong color! Its LED is red — try a matching port.');
+      if (!e.colorMatch) toast('Wrong port! Its LED shows ✕ — match the color and symbol.');
       break;
     case 'unplug': sfx.sfxUnplug(); sfx.buzz(8); break;
     case 'grab': sfx.sfxGrab(); break;

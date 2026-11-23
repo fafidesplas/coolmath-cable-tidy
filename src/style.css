@@ -13,8 +13,9 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 #lvl-sub { font-size: 12px; opacity: .65; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hud-stats { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 #conn { font-weight: 800; font-size: 14px; display: flex; align-items: center; gap: 6px; }
-#conn::before { content: ''; width: 9px; height: 9px; border-radius: 50%; background: #ffb020; box-shadow: 0 0 8px #ffb020; }
-#conn.ok::before { background: #4dff88; box-shadow: 0 0 8px #4dff88; }
+/* status dot: shape + brightness, not only hue ("!" amber = pending, "✓" bright green = all good) */
+#conn::before { content: '!'; width: 15px; height: 15px; border-radius: 50%; background: #f0a21a; color: #10140f; font-size: 11px; font-weight: 900; line-height: 15px; text-align: center; }
+#conn.ok::before { content: '✓'; background: #5dff95; box-shadow: 0 0 8px #5dff95; }
 .meter { width: 96px; height: 8px; border-radius: 4px; background: #0f141e; overflow: hidden; }
 #meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #ff7a59, #ffd166, #4dff88); transition: width .4s; }
 
@@ -104,3 +105,9 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
   .card { padding: 16px; }
   .logo { font-size: 42px; }
 }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.legend .chip { display: inline-flex; align-items: center; gap: 6px; background: white; border-radius: 999px; padding: 4px 10px 4px 4px; font-size: 14px; font-weight: 800; box-shadow: 0 2px 0 #ddd6c8; }
+.legend .chip small { font-weight: 700; opacity: .55; }
+.legend svg.badge, .a11y-note svg.badge { width: auto; height: auto; flex: 0 0 auto; }
+.a11y-note { font-size: 12px; opacity: .7; margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 3px; }

@@ -49,6 +49,16 @@ The drag checks also assert the grabbed point follows the pointer (< 1 px error)
 
 Fix history: cables used to jitter forever because the automatic curl remover teleported loop nodes every 12 frames and nothing ever went to sleep. See PLANNING.md §4.1.
 
+## Accessibility (color blindness)
+
+Colors are never the only cue:
+
+- **Palette** (Okabe–Ito based, CIE L* from 17 to 100 so lightness alone separates them): Black ≡ bars · Blue ■ square · Orange ◆ diamond · Sky ▲ triangle · Yellow ● circle · White ★ star. Colors that share a level are chosen to stay apart under every type of color blindness.
+- **Symbols** on every plug, every port tag and in the job legend (name + cable count). The game is playable in grayscale.
+- **LEDs** use shape + brightness, not just hue: bright green ✓ = working, amber ! = half connected, dark blinking red ✕ = wrong port. The HUD counter and the hover/snap feedback use the same ✓ / ✕.
+
+`npm run test:colors` (`tests/colors.test.ts`) simulates protanopia, deuteranopia and tritanopia (Machado 2009 at full severity, cross-checked with Viénot 1999 / Brettel 1997) and fails if any two colors in the same level have CIEDE2000 < 20, lightness difference |ΔL*| < 12 or luminance contrast < 1.4 under any vision type, or if symbols aren't unique. ΔE00 ≈ 10 is already "clearly different" side by side; 20 keeps thin cables distinct. A negative control checks that the old palette (blue/purple, red/green, yellow/orange) is rejected.
+
 ## Deploy
 
 Every push to `main` builds and deploys to GitHub Pages via `.github/workflows/deploy.yml`. Vite `base` is `/coolmath-cable-tidy/`.

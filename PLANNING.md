@@ -60,7 +60,7 @@ Read client brief → Untangle & connect (LEDs go green) → Tidy (ties, smooth 
 - Grab a plug (generous 34 px radius for fingers) — if it was plugged, it pops out with an *unplug* sound.
 - Grab anywhere on a cable body to pull it around.
 - Magnetic snap zone (44 px) with a dashed highlight ring; release to seat the plug.
-- Feedback per snap: layered synthesized click, port ring pulse, LED (green = cable complete, amber = right color but other end not done, red blinking = wrong color), `navigator.vibrate` pattern on supporting devices, extra chime + sparks when a cable becomes fully valid.
+- Feedback per snap: layered synthesized click, port ring pulse, LED with shape + brightness, never hue alone (bright green ✓ = cable complete, mid amber ! = right color but other end not done, dark blinking red ✕ = wrong color), a ✓/✕ badge while hovering a port, `navigator.vibrate` pattern on supporting devices, extra chime + sparks when a cable becomes fully valid.
 
 ### 4.3 Cable ties
 - Limited ties per job (1–4). Tap *Tie*, then tap where 2+ cables of the **same color** run close together.
@@ -114,8 +114,8 @@ Single-pointer input (extra fingers ignored) to avoid accidental multi-touch cha
 
 ## 7. Art & audio direction
 - **Art:** clean flat-vector with soft shading, fully procedural Canvas 2D (no image assets). Each world has a distinct backdrop: striped wallpaper, brick café, concrete workshop with hazard floor, acoustic-foam studio, blue rack rails.
-- **Readability:** color-coded tags under every port, LEDs above them, plug shape per world (RJ45 vs ferrule wires).
-- **Colorblind support (planned):** pattern/icon on each cable color + port tag; setting to show color names.
+- **Readability:** color + symbol badge on every port and plug, link LED beside each socket, plug shape per world (RJ45 vs ferrule wires).
+- **Colorblind support (done in M0):** Okabe–Ito-based palette with big lightness steps — Black ≡ bars, Blue ■ square, Orange ◆ diamond, Sky ▲ triangle, Yellow ● circle, White ★ star. No blue/purple, red/green or green/yellow pairs. Every symbol is on each plug, each port tag and the job legend (color name + count), so the game is fully playable in grayscale. `npm run test:colors` simulates protanopia, deuteranopia and tritanopia (Machado 2009 + Viénot/Brettel) and requires, for every pair of colors sharing a level, CIEDE2000 ≥ 20, |ΔL*| ≥ 12 and luminance contrast ≥ 1.4, plus unique symbols. Still open: a setting to show color names on badges.
 - **Audio:** 100% synthesized with Web Audio (no files): two-stage latch click, unplug pop, zip-tie ratchet, snip, chimes, star dings. Mute toggle persisted. Planned: soft lo-fi ambience per world.
 - **Haptics:** `navigator.vibrate` short patterns (snap, tie, all-good, stars) where supported.
 
@@ -138,7 +138,7 @@ Single-pointer input (extra fingers ignored) to avoid accidental multi-touch cha
 | Milestone | Content | Status |
 |---|---|---|
 | M0 Prototype | Physics, snap, ties, scoring, 5 jobs, before/after, Pages deploy | ✅ Done |
-| M1 Vertical slice | Polish pass, tutorial ghost hand, colorblind patterns, ambience, 10 jobs | Next |
+| M1 Vertical slice | Polish pass, tutorial ghost hand, ambience, 10 jobs (colorblind symbols shipped early) | Next |
 | M2 Content | 3 worlds × 10 jobs, cable length tray, labels, trays/rings | |
 | M3 Coolmath launch | Ad break hooks, analytics events, perf pass on low-end Android, localization | |
 
@@ -149,7 +149,7 @@ Single-pointer input (extra fingers ignored) to avoid accidental multi-touch cha
 | Performance with 20+ cables | Flat typed arrays + spatial hash; reduce iterations adaptively |
 | Players don't discover ties | Job 2 introduces ties with flashing button + hint; client goal mentions it |
 | Score feels arbitrary | Metric breakdown on results; live meter; crossings highlighted (planned) |
-| Color reliance | Colorblind patterns + labels (M1) |
+| Color reliance | CVD-safe palette + symbol per color + shaped LEDs, guarded by `npm run test:colors` ✅ |
 
 ## 11. Success metrics (post-launch)
 - ≥ 70% of players finish job 1; ≥ 40% reach job 5.

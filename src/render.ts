@@ -1,9 +1,13 @@
 import { Game, W, H, FLOOR, PLUG_LEN, REP_R, TIE_R, Cable, End, Port } from './game';
 import { COLORS, DeviceDef, Theme } from './levels';
+import { drawBadge, drawStatusLed, type LedState } from './symbols';
 
 type C2D = CanvasRenderingContext2D;
 
 export interface DrawOpts { ui: boolean; tieMode: boolean }
+
+const PORT_BADGE_R = 11;
+const PLUG_BADGE_R = 10.5;
 
 function rr(ctx: C2D, x: number, y: number, w: number, h: number, r: number) {
   ctx.beginPath();
@@ -134,22 +138,22 @@ function drawDevice(ctx: C2D, g: Game, d: DeviceDef, t: number) {
       for (const ax of [d.x + 26, d.x + d.w - 34]) { rr(ctx, ax, d.y - 70, 8, 74, 4); ctx.fill(); }
       body(ctx, d, '#f7f9fc', '#c9d1dc', 16);
       label(ctx, d.label, d.x + d.w / 2, d.y + 22, '#5a6474', 14);
-      const leds: [string, string | null][] = [
-        ['PWR', '#4dff88'],
-        ['NET', ok || g.allGood ? '#4dff88' : (blink(0) ? '#ffb020' : null)],
-        ['WIFI', g.allGood ? (blink(2) ? '#4dff88' : '#2fae5d') : null],
+      const leds: [string, LedState][] = [
+        ['PWR', 'ok'],
+        ['NET', ok || g.allGood ? 'ok' : 'warn'],
+        ['WIFI', g.allGood ? 'ok' : 'off'],
       ];
-      leds.forEach(([n, c], i) => {
+      leds.forEach(([n, st], i) => {
         const lx = d.x + d.w / 2 - 60 + i * 60;
-        led(ctx, lx, d.y + 42, 5, c);
-        label(ctx, n, lx, d.y + 55, '#8a93a1', 9);
+        drawStatusLed(ctx, lx, d.y + 40, 6.5, st, blink(i) === 1);
+        label(ctx, n, lx, d.y + 54, '#8a93a1', 9);
       });
       break;
     }
     case 'ont':
       body(ctx, d, '#ffffff', '#dfe4ea', 10);
       label(ctx, d.label, d.x + d.w / 2, d.y + 44, '#596273', 12);
-      led(ctx, d.x + d.w / 2, d.y + 58, 4, ok ? '#4dff88' : '#ff4d4d');
+      drawStatusLed(ctx, d.x + d.w / 2, d.y + 58, 6, ok ? 'ok' : 'bad', blink(0) === 1);
       break;
     case 'tv': {
       body(ctx, d, '#2b2f36', '#1b1e23', 8);
@@ -211,11 +215,6 @@ function drawDevice(ctx: C2D, g: Game, d: DeviceDef, t: number) {
     case 'terminal':
       body(ctx, d, '#ece3c9', '#cfc3a1', 5);
       label(ctx, d.label, d.x + d.w / 2, d.y + d.h - 9, '#7d7254', 10);
-      for (const p of ports) {
-        ctx.fillStyle = '#b8bec6'; ctx.beginPath(); ctx.arc(p.x, d.y + 44, 6, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = '#6d737b'; ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.moveTo(p.x - 4, d.y + 44); ctx.lineTo(p.x + 4, d.y + 44); ctx.stroke();
-      }
       break;
     case 'patch':
       body(ctx, d, '#30343b', '#1d2025', 4);
@@ -230,10 +229,11 @@ function drawDevice(ctx: C2D, g: Game, d: DeviceDef, t: number) {
       if (d.style === 'server') {
         for (let i = 0; i < 6; i++) {
           ctx.fillStyle = '#0f1218'; rr(ctx, d.x + 14 + i * 38, d.y + 40, 32, 12, 2); ctx.fill();
-          led(ctx, d.x + 40 + i * 38, d.y + 46, 2.5, ok ? (blink(i) ? '#4dff88' : '#1f7a40') : '#ff4d4d', ok);
+          // working: bright blinking activity lights; broken: dim, steady (brightness, not just hue)
+          led(ctx, d.x + 40 + i * 38, d.y + 46, 2.5, ok ? (blink(i) ? '#5dff95' : '#1f7a40') : '#5a1414', ok);
         }
       }
-      led(ctx, d.x + d.w - 20, d.y + 18, 4, ok || (d.style === 'switch' && g.allGood) ? '#4dff88' : (blink(3) ? '#ffb020' : null));
+      drawStatusLed(ctx, d.x + d.w - 20, d.y < H / 2 ? d.y + 18 : d.y + d.h - 16, 6.5, ok || (d.style === 'switch' && g.allGood) ? 'ok' : 'warn', blink(3) === 1);
       break;
     }
   }
@@ -241,20 +241,17 @@ function drawDevice(ctx: C2D, g: Game, d: DeviceDef, t: number) {
 
 // ---------------------------------------------------------------- ports
 function drawPort(ctx: C2D, g: Game, p: Port, t: number) {
-  const col = COLORS[p.color];
   const s = p.dir; // 1 => opens downward (socket inside above y)
   ctx.fillStyle = '#121418';
   rr(ctx, p.x - 11, s === 1 ? p.y - 14 : p.y, 22, 14, 3); ctx.fill();
   ctx.fillStyle = '#2a2e35';
   rr(ctx, p.x - 8, s === 1 ? p.y - 11 : p.y + 3, 16, 8, 2); ctx.fill();
-  // color code tag
-  ctx.fillStyle = col.base;
-  rr(ctx, p.x - 9, s === 1 ? p.y - 22 : p.y + 17, 18, 5, 2); ctx.fill();
-  // LED
+  // colour + symbol tag (readable without colour vision)
+  drawBadge(ctx, p.color, p.x, s === 1 ? p.y - 28 : p.y + 28, PORT_BADGE_R);
+  // link LED beside the socket, like a real jack: shape + brightness, not just hue
   const st = g.ledState(p);
-  const blink = Math.sin(t * 10) > 0;
-  const c = st === 'green' ? '#4dff88' : st === 'amber' ? '#ffb020' : st === 'red' ? (blink ? '#ff4d4d' : '#7a1d1d') : null;
-  led(ctx, p.x, s === 1 ? p.y - 31 : p.y + 30, 3.5, c);
+  const ls: LedState = st === 'green' ? 'ok' : st === 'amber' ? 'warn' : st === 'red' ? 'bad' : 'off';
+  drawStatusLed(ctx, p.x + 19, s === 1 ? p.y - 7 : p.y + 7, 7, ls, Math.sin(t * 10) > 0);
   if (p.pulse > 0) {
     ctx.strokeStyle = `rgba(255,255,255,${p.pulse * 0.8})`;
     ctx.lineWidth = 3;
@@ -312,6 +309,8 @@ function drawPlug(ctx: C2D, g: Game, e: End, wire: boolean) {
     ctx.fillStyle = 'rgba(80,95,115,0.5)'; ctx.fillRect(8, -8, 7, 2.5);
   }
   ctx.restore();
+  // upright colour + symbol badge on the boot of every plug
+  drawBadge(ctx, e.cable.color, pg.ex - pg.dx * 12, pg.ey - pg.dy * 12, PLUG_BADGE_R);
 }
 
 function drawTie(ctx: C2D, t: { x: number; y: number; nx: number; ny: number; entries: unknown[]; t: number }, hi: boolean) {
@@ -355,6 +354,7 @@ export function drawScene(ctx: C2D, g: Game, opts: DrawOpts) {
     if (f.kind === 'ring') {
       ctx.strokeStyle = f.color; ctx.globalAlpha = 1 - k; ctx.lineWidth = 3;
       ctx.beginPath(); ctx.arc(f.x, f.y, 10 + k * 34, 0, Math.PI * 2); ctx.stroke();
+      if (f.glyph) drawStatusLed(ctx, f.x + 26, f.y - 10 - k * 24, 9, f.glyph);
     } else {
       ctx.fillStyle = f.color; ctx.globalAlpha = 1 - k;
       for (let i = 0; i < 8; i++) {
@@ -374,6 +374,8 @@ export function drawScene(ctx: C2D, g: Game, opts: DrawOpts) {
     ctx.setLineDash([5, 4]);
     ctx.beginPath(); ctx.arc(p.x, p.y, 20 + Math.sin(t * 10) * 2, 0, Math.PI * 2); ctx.stroke();
     ctx.setLineDash([]);
+    // explicit match / no-match glyph next to the target port
+    drawStatusLed(ctx, p.x - 24, p.dir === 1 ? p.y + 14 : p.y - 14, 8, match ? 'ok' : 'bad');
   }
   if (opts.tieMode && g.pointer.x > 0) {
     ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 2; ctx.setLineDash([6, 5]);
