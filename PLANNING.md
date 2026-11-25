@@ -67,6 +67,13 @@ Read client brief → Untangle & connect (LEDs go green) → Tidy (ties, smooth 
 - The tie gathers those cables (ordered by their current side-by-side position to avoid twisting) and zips them into a neat parallel bundle with a ratchet sound.
 - Ties can be dragged to slide the bundle; tap a tie to snip it and get it back.
 
+### 4.3a Tangles and slack (Nov 2026)
+- **Braids:** two cables crossing twice with nothing held in between swap the shapes of those stretches (no visible movement), so the crossings vanish. Same color: any length. Different colors: only short twists (14 nodes); bigger tangles stay for the player.
+- **Flick:** once everything is connected, tapping a yellow ring resolves that crossing. A held cable stays put and the free one goes around it. If it truly can't be undone, the game says why.
+- **Lift:** the stretch in the player's hand passes over other cables instead of snagging.
+- **Slack flows:** each segment has its own rest length; holders guide cables but don't clamp them, so slack evens out across ties, hooks, wraps and ducts (`Game.balance`), and reels wind both sides. Nodes are re-indexed when a stretch changes length a lot (`renode`).
+- Bundle lanes are ordered like the ports once all their cables are plugged.
+
 ### 4.3b Tools of the trade (Nov 2026)
 Tap tools act on a tap and a drag still moves cables, so there is no mode friction.
 

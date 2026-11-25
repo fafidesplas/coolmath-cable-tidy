@@ -8,6 +8,9 @@ export const SEG = 13;
 export const PLUG_LEN = 22;
 export const REP_R = 9;
 export const TIE_R = 72;
+/** same-color cables this far from the tap are still gathered by a tie or wrap */
+export const GATHER_R = 120;
+const LIFT = 9; // nodes on each side of the hand that are lifted over the other cables
 export const COMB_R = 140;
 export const HOOK_R = 40;
 export const REEL_R = 20;
@@ -38,7 +41,9 @@ const SLEEP_GROW_MAX = 4;
 const WAKE_V = 0.5; // px per frame: an awake node this fast touching a sleeping cable wakes it
 const CAB_STATIC = 0.5; // px per substep: slower relative slides between touching cables stick
 const CAB_KINETIC = 0.3; // fraction of a faster relative slide removed per contact pass
-const MAX_UNTWISTS = 3; // auto curl fixes per cable between player interactions
+const MAX_BRAIDS = 12; // ditto for braids between a pair of cables
+const BRAID_DIFF = 14; // longest twist (in nodes) two cables of different colors shed by themselves
+const MAX_UNTWISTS = 8; // auto curl fixes per cable between player interactions
 const GC = 40; // grid cols (cell 18px)
 const GR = 50;
 const CELL = 18;
@@ -61,11 +66,13 @@ export interface TieEntry { cable: Cable; idx: number; off: number; t?: number }
 export interface Tie {
   kind: TieKind; x: number; y: number; nx: number; ny: number; color: ColorKey; entries: TieEntry[]; t: number;
   /** zip ties: 1 = the tail still sticks out, 0 = trimmed flush */
-  tail: number; run?: Run;
+  tail: number; run?: Run; duct?: Duct;
+  /** holders with the same id grip one cable as a unit (all stations of a run, all slots of a duct) */
+  gid: number;
 }
 /** A comb / spiral-wrap stroke: a chain of stations laid along the cables. */
 export interface Run {
-  kind: 'comb' | 'wrap'; color: ColorKey; stations: Tie[];
+  kind: 'comb' | 'wrap'; gid: number; color: ColorKey; stations: Tie[];
   live: { cable: Cable; idx: number; s: number; lane: number }[];
   ux: number; uy: number; ended: boolean;
 }
@@ -73,6 +80,7 @@ export interface Hook { x: number; y: number; cap: number; tie: Tie }
 export interface Duct { x: number; y: number; w: number; h: number; st: Tie[]; lid: number; shine: number }
 export interface Reel { cable: Cable; idx: number; spin: number; pop: number; tight: boolean; acc: number }
 export interface Dust { x: number; y: number; r: number; a: number; hp: number; vx: number; vy: number; gone: boolean }
+interface Cross { i: number; j: number; x: number; y: number }
 export interface Pulse { cable: Cable; t: number; dur: number; from: 0 | 1; strong: boolean; delay: number }
 export interface Bit { x: number; y: number; vx: number; vy: number; rot: number; vr: number; w: number; h: number; color: string; t: number; life: number; g: number }
 
@@ -98,7 +106,7 @@ export type Pick =
 export interface Task { id: string; label: string; done: number; total: number }
 
 export type GameEvent =
-  | { type: 'trim' } | { type: 'velcro' } | { type: 'rip' } | { type: 'hook' } | { type: 'unhook' }
+  | { type: 'flick' } | { type: 'trim' } | { type: 'velcro' } | { type: 'rip' } | { type: 'hook' } | { type: 'unhook' }
   | { type: 'wind'; k: number } | { type: 'windTight' } | { type: 'unspool' } | { type: 'payout' } | { type: 'reel' }
   | { type: 'comb'; n: number } | { type: 'combDone' } | { type: 'wrap'; n: number } | { type: 'wrapDone' }
   | { type: 'label' } | { type: 'dust' } | { type: 'dustDone' } | { type: 'screw'; k: number } | { type: 'screwDone' }
@@ -133,17 +141,31 @@ export class Cable {
   still = 0;
   /** automatic curl fixes since the player last interacted (capped so it can't loop forever) */
   untwists = 0;
-  /** rest segment length with nothing wound on a reel */
-  seg0: number;
+  /** rest length of each segment; sums to `length - wound` (see Game.balance) */
+  len: Float32Array;
+  /** cum[i] = rest length from node 0 to node i */
+  cum: Float32Array;
+  /** px of cable currently on a reel */
+  wound = 0;
+  /** 0 = free node, otherwise the id of whatever holds it (tie, run, hook, duct) */
+  grp: Int32Array;
   /** 0 = no label, otherwise its printing/wrapping animation 0..1 */
   label = 0;
   constructor(public id: number, public color: ColorKey, public length: number, offset: number) {
     const segs = Math.max(8, Math.round(length / SEG));
     this.n = segs + 1;
-    this.seg = this.seg0 = length / segs;
+    this.seg = length / segs;
+    this.len = new Float32Array(segs).fill(this.seg);
+    this.cum = new Float32Array(this.n);
+    this.grp = new Int32Array(this.n);
+    this.measure();
     this.o = offset;
     this.pin = new Uint8Array(this.n);
     this.ends = [{ cable: this, which: 0, port: null }, { cable: this, which: 1, port: null }];
+  }
+  measure() {
+    for (let i = 0; i < this.n - 1; i++) this.cum[i + 1] = this.cum[i] + this.len[i];
+    this.seg = this.cum[this.n - 1] / (this.n - 1);
   }
   endIdx(w: 0 | 1) { return w === 0 ? 0 : this.n - 1; }
   innerIdx(w: 0 | 1) { return w === 0 ? 1 : this.n - 2; }
@@ -182,11 +204,12 @@ export class Game {
   pulses: Pulse[] = [];
   /** uses left of each tool in this job */
   left: Record<ToolId, number>;
-  crossPts: { x: number; y: number }[] = [];
+  crossPts: { x: number; y: number; a: Cable; b: Cable }[] = [];
   /** what a press right now would grab (for the hover highlight) */
   hover: Pick | null = null;
   /** finishing power-up sequence: seconds since the lever was thrown (-1 = off) */
   power = -1;
+  private nextGid = 1;
   private powerQueue: { at: number; cable: Cable; i: number }[] = [];
   private nextAmbient = 2;
   private dustTotal = 0;
@@ -219,11 +242,14 @@ export class Game {
     this.left = Object.fromEntries(ALL_TOOLS.map((t) => [t, level.tools[t] ?? 0])) as Record<ToolId, number>;
     level.ports.forEach((p, i) => this.ports.push({ id: i, ...p, end: null, pulse: 0, out: 0, tight: 0 }));
     for (const f of level.fixtures ?? []) {
-      const tie = (x: number, y: number, kind: TieKind): Tie => ({ kind, x, y, nx: 1, ny: 0, color: 'black', entries: [], t: 1, tail: 0 });
+      const gid = this.nextGid++;
+      const tie = (x: number, y: number, kind: TieKind): Tie => ({ kind, x, y, nx: 1, ny: 0, color: 'black', entries: [], t: 1, tail: 0, gid });
       if (f.type === 'hook') this.hooks.push({ x: f.x, y: f.y, cap: f.cap, tie: tie(f.x, f.y, 'hook') });
       else {
         const cx = f.x + f.w / 2;
         this.ducts.push({ x: f.x, y: f.y, w: f.w, h: f.h, lid: 0, shine: 0, st: [0, 0.5, 1].map((k) => tie(cx, f.y + 14 + (f.h - 28) * k, 'duct')) });
+        const du = this.ducts[this.ducts.length - 1];
+        for (const t of du.st) t.duct = du;
       }
     }
     this.ties.push(...this.hooks.map((h) => h.tie), ...this.ducts.flatMap((d) => d.st));
@@ -262,6 +288,7 @@ export class Game {
     this.sleep = new Uint8Array(this.cables.length);
     this.uf = new Int16Array(this.cables.length);
     this.laneOf = new Uint8Array(this.cables.length);
+    this.braids = new Uint8Array(this.cables.length ** 2);
     this.ptC = new Int16Array(off); this.ptI = new Int16Array(off);
     this.next = new Int32Array(off);
     for (const c of this.cables) {
@@ -353,7 +380,8 @@ export class Game {
     this.fx = this.fx.filter((f) => f.t < 0.8);
     this.animate(dt);
     this.updateGrab(dt);
-    if (this.frame % 2 === 0) this.slideAll();
+    this.computePins();
+    for (const c of this.cables) if (!this.sleep[c.id]) this.balance(c);
     const sub = 2, h = dt / sub;
     this.FX.set(this.X); this.FY.set(this.Y);
     for (let i = 0; i < this.uf.length; i++) this.uf[i] = i;
@@ -372,7 +400,7 @@ export class Game {
       }
     }
     void silent;
-    if (++this.frame % 12 === 0) this.untwist();
+    if (++this.frame % 12 === 0) { this.untwist(); this.unbraid(); }
     this.wakeByContact();
     this.updateSleep();
   }
@@ -396,7 +424,7 @@ export class Game {
   }
 
   /** Player-driven change (grab, plug, tie...): wake everything and re-arm auto-untwist. */
-  wakeAll() { this.idleFrames = 0; for (const c of this.cables) { this.wake(c); c.untwists = 0; } }
+  wakeAll() { this.idleFrames = 0; this.braids.fill(0); for (const c of this.cables) { this.wake(c); c.untwists = 0; } }
 
   /** Anything the player is touching (or a tie still closing) must simulate. */
   private forceWake() {
@@ -491,20 +519,15 @@ export class Game {
   private untwist() {
     for (const c of this.cables) {
       if (this.isGrabbed(c) || this.sleep[c.id] || c.untwists >= MAX_UNTWISTS) continue;
-      const { x, y, px, py } = c;
+      const { x, y } = c;
       for (let i = 1; i < c.n - 4; i++) {
-        for (let j = i + 3; j < Math.min(c.n - 2, i + 26); j++) {
+        for (let j = i + 3; j < Math.min(c.n - 2, i + 40); j++) {
           if (!segX(x[i], y[i], x[i + 1], y[i + 1], x[j], y[j], x[j + 1], y[j + 1])) continue;
           let blocked = false;
           for (let k = i + 1; k <= j && !blocked; k++) blocked = !!c.pin[k];
           if (!blocked) blocked = this.ties.some((t) => t.entries.some((e) => e.cable === c && e.idx > i && e.idx <= j));
           if (blocked) continue;
-          for (let a = i + 1, b = j; a < b; a++, b--) {
-            let t = x[a]; x[a] = x[b]; x[b] = t;
-            t = y[a]; y[a] = y[b]; y[b] = t;
-            t = px[a]; px[a] = px[b]; px[b] = t;
-            t = py[a]; py[a] = py[b]; py[b] = t;
-          }
+          this.reverse(c, i, j);
           this.wakeIsland(c);
           c.untwists++;
           i = j;
@@ -513,6 +536,128 @@ export class Game {
       }
     }
   }
+
+  /** Reverse the node order between two crossing segments: the loop opens without moving. */
+  private reverse(c: Cable, i: number, j: number) {
+    for (const v of [c.x, c.y, c.px, c.py]) for (let a = i + 1, b = j; a < b; a++, b--) { const t = v[a]; v[a] = v[b]; v[b] = t; }
+  }
+
+  /**
+   * Braids: when two cables cross twice with nothing holding them in between, the two stretches
+   * swap shapes (each cable takes the path the other one had), so both crossings vanish without
+   * any visible movement; contact then pushes them apart on the right sides. Same-color cables
+   * run together, so any braid between them slips loose; different colors only shed short twists,
+   * big tangles are still the player's job. Budgeted like untwist() so the scene can rest.
+   */
+  private unbraid() {
+    const cs = this.cables;
+    const tr = cs.map((c) => (this.isGrabbed(c) ? null : this.trace(c)));
+    for (let ia = 0; ia < cs.length; ia++) for (let ib = ia + 1; ib < cs.length; ib++) {
+      const a = cs[ia], b = cs[ib];
+      if ((this.sleep[ia] && this.sleep[ib]) || this.isGrabbed(a) || this.isGrabbed(b)) continue;
+      const key = ia * cs.length + ib;
+      if (this.braids[key] >= MAX_BRAIDS) continue;
+      const max = a.color === b.color ? 80 : BRAID_DIFF;
+      const xs = this.crossList(a, b, tr[ia]!, tr[ib]!);
+      for (let k = 0; k + 1 < xs.length; k++) {
+        const p = xs[k], q = xs[k + 1];
+        if (q.i - p.i > max || Math.abs(q.j - p.j) > max) continue;
+        if (!this.resolve(a, b, p, q)) continue;
+        tr[ia] = this.trace(a); tr[ib] = this.trace(b);
+        this.braids[key]++;
+        this.wakeIsland(a); this.wakeIsland(b);
+        break;
+      }
+    }
+  }
+
+  /** Node i of a cable, with virtual nodes past a seated plug (inside its device). */
+  private nodeAt(c: Cable, i: number): [number, number] {
+    const p = i < 0 ? c.ends[0].port : i >= c.n ? c.ends[1].port : null;
+    if (p) return [p.x, p.y - p.dir * 60];
+    const k = clamp(i, 0, c.n - 1);
+    return [c.x[k], c.y[k]];
+  }
+
+  /** Flat copy of a cable's points including the virtual ends, with its bounding box. */
+  private trace(c: Cable) {
+    const i0 = c.ends[0].port ? -1 : 0, i1 = c.ends[1].port ? c.n : c.n - 1, m = i1 - i0 + 1;
+    const x = new Float64Array(m), y = new Float64Array(m);
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let k = 0; k < m; k++) {
+      const i = i0 + k, real = i >= 0 && i < c.n;
+      const p = real ? null : this.nodeAt(c, i);
+      const vx = (x[k] = p ? p[0] : c.x[i]), vy = (y[k] = p ? p[1] : c.y[i]);
+      if (vx < x0) x0 = vx; if (vx > x1) x1 = vx; if (vy < y0) y0 = vy; if (vy > y1) y1 = vy;
+    }
+    return { x, y, m, i0, x0, x1, y0, y1 };
+  }
+
+  private crossList(a: Cable, b: Cable, A = this.trace(a), B = this.trace(b)) {
+    const out: Cross[] = [];
+    if (A.x1 < B.x0 || B.x1 < A.x0 || A.y1 < B.y0 || B.y1 < A.y0) return out;
+    for (let i = 0; i < A.m - 1; i++) {
+      const ax = A.x[i], ay = A.y[i], bx = A.x[i + 1], by = A.y[i + 1];
+      const x0 = Math.min(ax, bx), x1 = Math.max(ax, bx), y0 = Math.min(ay, by), y1 = Math.max(ay, by);
+      if (x1 < B.x0 || x0 > B.x1 || y1 < B.y0 || y0 > B.y1) continue;
+      const hits: (Cross & { u: number })[] = [];
+      for (let j = 0; j < B.m - 1; j++) {
+        const cx = B.x[j], cy = B.y[j], dx = B.x[j + 1], dy = B.y[j + 1];
+        if ((cx < x0 && dx < x0) || (cx > x1 && dx > x1) || (cy < y0 && dy < y0) || (cy > y1 && dy > y1)) continue;
+        if (!segX(ax, ay, bx, by, cx, cy, dx, dy)) continue;
+        const rx = bx - ax, ry = by - ay, sx = dx - cx, sy = dy - cy;
+        const u = ((cx - ax) * sy - (cy - ay) * sx) / (rx * sy - ry * sx || 1e-6);
+        hits.push({ i: i + A.i0, j: j + B.i0, x: ax + rx * u, y: ay + ry * u, u });
+      }
+      if (hits.length) out.push(...hits.sort((m, n) => m.u - n.u));
+    }
+    return out;
+  }
+
+  /** Undo the double crossing p..q. Whatever is held stays put and the other cable goes around it. */
+  private resolve(a: Cable, b: Cable, p: Cross, q: Cross): boolean {
+    let ha = false, hb = false;
+    const j0 = Math.min(p.j, q.j), j1 = Math.max(p.j, q.j);
+    for (let i = Math.max(0, p.i + 1); i <= Math.min(a.n - 1, q.i); i++) ha ||= !!a.pin[i];
+    for (let j = Math.max(0, j0 + 1); j <= Math.min(b.n - 1, j1); j++) hb ||= !!b.pin[j];
+    if (ha && hb) return false;
+    if (!ha && !hb) this.swapArcs(a, p.i, q.i, b, p.j, q.j, p, q);
+    else if (hb) this.goAround(a, p.i, q.i, b, p, q, p.j, q.j);
+    else if (p.j <= q.j) this.goAround(b, p.j, q.j, a, p, q, p.i, q.i);
+    else this.goAround(b, q.j, p.j, a, q, p, q.i, p.i);
+    return true;
+  }
+
+  /** Lay nodes i0+1..i1 of `m` along the other (held) cable, just off it on the side `m` comes from. */
+  private goAround(m: Cable, i0: number, i1: number, o: Cable, p: Cross, q: Cross, op: number, oq: number) {
+    const P: number[][] = [[p.x, p.y]];
+    if (oq >= op) for (let j = op + 1; j <= oq; j++) P.push(this.nodeAt(o, j)); else for (let j = op; j > oq; j--) P.push(this.nodeAt(o, j));
+    P.push([q.x, q.y]);
+    const from = this.nodeAt(m, i0), t = P[1];
+    const side = Math.sign((t[0] - p.x) * (from[1] - p.y) - (t[1] - p.y) * (from[0] - p.x)) || 1;
+    const N = i1 - i0;
+    for (let k = 1; k <= N; k++) {
+      const u = k / (N + 1), c = along(P, u), d = along(P, Math.min(1, u + 0.04)), e = along(P, Math.max(0, u - 0.04));
+      const tx = d[0] - e[0], ty = d[1] - e[1], l = Math.hypot(tx, ty) || 1;
+      const i = i0 + k;
+      m.x[i] = m.px[i] = clamp(c[0] - (ty / l) * side * 12, 8, W - 8);
+      m.y[i] = m.py[i] = clamp(c[1] + (tx / l) * side * 12, 8, FLOOR);
+    }
+  }
+
+  private swapArcs(a: Cable, i0: number, i1: number, b: Cable, jp: number, jq: number, p: { x: number; y: number }, q: { x: number; y: number }) {
+    const fwd = jq >= jp, j0 = Math.min(jp, jq), j1 = Math.max(jp, jq);
+    const A: number[][] = [[p.x, p.y]], B: number[][] = [[p.x, p.y]];
+    for (let i = i0 + 1; i <= i1; i++) A.push([a.x[i], a.y[i]]);
+    if (fwd) for (let j = j0 + 1; j <= j1; j++) B.push([b.x[j], b.y[j]]);
+    else for (let j = j1; j > j0; j--) B.push([b.x[j], b.y[j]]);
+    A.push([q.x, q.y]); B.push([q.x, q.y]);
+    const put = (c: Cable, i: number, pt: number[]) => { c.x[i] = c.px[i] = pt[0]; c.y[i] = c.py[i] = pt[1]; };
+    const na = i1 - i0, nb = j1 - j0;
+    for (let k = 1; k <= na; k++) put(a, i0 + k, along(B, k / (na + 1)));
+    for (let k = 1; k <= nb; k++) put(b, fwd ? j0 + k : j1 + 1 - k, along(A, k / (nb + 1)));
+  }
+  private braids: Uint8Array;
 
   private computePins() {
     this.PIN.fill(0);
@@ -548,7 +693,7 @@ export class Game {
     const IM = this.IM;
     for (const c of this.cables) {
       if (this.sleep[c.id]) continue;
-      const { x, y, pin, seg, o } = c;
+      const { x, y, pin, len, o } = c;
       for (let q = 0; q < c.n - 1; q++) {
         const i = back ? c.n - 2 - q : q;
         const dx = x[i + 1] - x[i], dy = y[i + 1] - y[i];
@@ -556,7 +701,7 @@ export class Game {
         const w1 = pin[i] ? 0 : IM[o + i], w2 = pin[i + 1] ? 0 : IM[o + i + 1];
         const ws = w1 + w2;
         if (!ws) continue;
-        const k = (d - seg) / d / ws;
+        const k = (d - len[i]) / d / ws;
         x[i] += dx * k * w1; y[i] += dy * k * w1;
         x[i + 1] -= dx * k * w2; y[i + 1] -= dy * k * w2;
       }
@@ -570,11 +715,11 @@ export class Game {
   private tether() {
     for (const c of this.cables) {
       if (this.sleep[c.id]) continue;
-      const { x, y, pin, seg } = c;
+      const { x, y, pin, cum } = c;
       for (let p = 0; p < c.n; p++) {
         if (!pin[p]) continue;
         for (const s of [-1, 1]) for (let i = p + s; i >= 0 && i < c.n && !pin[i]; i += s) {
-          const max = Math.abs(i - p) * seg * 1.01;
+          const max = Math.abs(cum[i] - cum[p]) * 1.01;
           const dx = x[i] - x[p], dy = y[i] - y[p], d = Math.hypot(dx, dy);
           if (d > max) { x[i] = x[p] + (dx / d) * max; y[i] = y[p] + (dy / d) * max; }
         }
@@ -586,10 +731,11 @@ export class Game {
     for (const c of this.cables) {
       if (this.sleep[c.id]) continue;
       const { x, y, pin } = c;
-      const min = c.seg * 1.82;
+      const cum = c.cum;
       for (let i = 0; i < c.n - 2; i++) {
         const dx = x[i + 2] - x[i], dy = y[i + 2] - y[i];
         const d = Math.hypot(dx, dy) || 0.0001;
+        const min = (cum[i + 2] - cum[i]) * 0.91;
         if (d >= min) continue;
         const w1 = pin[i] ? 0 : 1, w2 = pin[i + 2] ? 0 : 1;
         const ws = w1 + w2;
@@ -598,10 +744,10 @@ export class Game {
         x[i] += dx * k * w1; y[i] += dy * k * w1;
         x[i + 2] -= dx * k * w2; y[i + 2] -= dy * k * w2;
       }
-      const min4 = c.seg * 3.5;
       for (let i = 0; i < c.n - 4; i++) {
         const dx = x[i + 4] - x[i], dy = y[i + 4] - y[i];
         const d = Math.hypot(dx, dy) || 0.0001;
+        const min4 = (cum[i + 4] - cum[i]) * 0.875;
         if (d >= min4) continue;
         const w1 = pin[i] ? 0 : 1, w2 = pin[i + 4] ? 0 : 1;
         const ws = w1 + w2;
@@ -626,6 +772,11 @@ export class Game {
     const R2 = REP_R * REP_R;
     // cables sharing a duct are already in ordered lanes: let them slip past each other so a
     // crossing made while they were being laid pulls out as they go taut
+    const gb = this.grab;
+    let up = null as Cable | null, u0 = 0, u1 = -1;
+    if (gb?.kind === 'cable' && gb.cable && !gb.hold && gb.moved) { up = gb.cable; u0 = gb.idx! - LIFT; u1 = gb.idx! + LIFT; }
+    else if (gb?.kind === 'plug' && gb.end && !gb.latch) { up = gb.end.cable; if (gb.end.which === 0) u1 = LIFT; else { u0 = up.n - 1 - LIFT; u1 = up.n; } }
+    if (up) { u0 += up.o; u1 = Math.min(u1 + up.o, up.o + up.n - 1); u0 = Math.max(u0, up.o); }
     const lane = this.laneOf.fill(0);
     this.ducts.forEach((d, i) => { for (const e of d.st[0].entries) lane[e.cable.id] = i + 1; });
     for (let k = 0; k < this.total; k++) {
@@ -645,6 +796,8 @@ export class Game {
             if (d2 >= R2 || d2 < 1e-6) continue;
             const dl = lane[ptC[k]];
             if (dl && dl === lane[ptC[j]]) continue;
+            // the part in the player's hand passes over the rest instead of snagging on it
+            if (up && ((k >= u0 && k <= u1) || (j >= u0 && j <= u1))) continue;
             this.union(ptC[k], ptC[j]);
             const sk = sleep[ptC[k]], sj = sleep[ptC[j]];
             if (sk && sj) continue;
@@ -745,7 +898,7 @@ export class Game {
       let j = i + s;
       while (j >= 0 && j < c.n && !c.pin[j]) j += s;
       if (j < 0 || j >= c.n) continue;
-      const max = Math.abs(j - i) * c.seg * 1.005;
+      const max = Math.abs(c.cum[j] - c.cum[i]) * 1.005;
       const dx = x - c.x[j], dy = y - c.y[j], d = Math.hypot(dx, dy);
       if (d <= max) continue;
       over = Math.max(over, d - max);
@@ -809,8 +962,8 @@ export class Game {
     return Math.hypot(x - ax - vx * k, y - ay - vy * k);
   }
 
-  private inClosedDuct(x: number, y: number) {
-    return this.ducts.find((d) => d.lid >= 1 && x > d.x - 6 && x < d.x + d.w + 6 && y > d.y - 4 && y < d.y + d.h + 4) ?? null;
+  private inClosedDuct(x: number, y: number, my = 4) {
+    return this.ducts.find((d) => d.lid >= 1 && x > d.x - 6 && x < d.x + d.w + 6 && y > d.y - my && y < d.y + d.h + my) ?? null;
   }
 
   lidHandle(d: Duct) { return { x: d.x + d.w / 2, y: d.y + d.h * d.lid - (d.lid < 0.05 ? 16 : 0) }; }
@@ -984,6 +1137,7 @@ export class Game {
     if (!g) return;
     this.wakeAll();
     const tap = !g.moved && g.t < 0.35;
+    if (tap && this.allGood && (g.kind === 'cable' || (g.kind === 'plug' && g.latch)) && this.flick(g.x, g.y)) { this.hoverPort = null; return; }
     if (g.kind === 'plug' && g.end) {
       if (g.latch) g.latch.out = Math.max(g.latch.out, 0.01);
       else if (this.hoverPort) this.plugIn(g.end, this.hoverPort);
@@ -1095,13 +1249,14 @@ export class Game {
       const c = g.end?.cable ?? g.cable!;
       const at = g.end ? c.endIdx(g.end.which) : g.idx!;
       if (g.over > 10 && this.unzipComb(c, at)) { /* peeled out of the comb one tooth at a time */ }
-      else if (c.seg < c.seg0) { // a reel pays out like a retractable cord
-        c.seg = Math.min(c.seg0, c.seg + Math.min(0.28, g.over / c.n));
+      else if (c.wound > 0) { // a reel pays out like a retractable cord
+        this.setWound(c, c.wound - Math.min(14, g.over));
         for (const r of this.reels) if (r.cable === c) { r.spin -= 0.25; r.tight = false; }
         if (this.frame % 4 === 0) this.onEvent({ type: 'payout' });
       } else if (g.over > 26 && g.t - this.lastStrain > 0.9) { this.lastStrain = g.t; this.onEvent({ type: 'strain' }); }
     } else if (g.t < 0.05) this.lastStrain = -1;
     if (g.kind === 'reel' && g.reel && g.t > 0.16) this.wind(g.reel, dt);
+    if (g.kind === 'run' && g.run && g.moved) this.extendRun(g.run, g.x, g.y);
     if (g.kind === 'air') this.blow(g.x, g.y, dt);
     if (g.kind === 'screw' && g.port) {
       const p = g.port;
@@ -1202,21 +1357,116 @@ export class Game {
   }
 
   placeTie(x: number, y: number, kind: 'zip' | 'velcro' = 'zip'): boolean {
-    if (this.left[kind] <= 0) return this.toast(kind === 'zip' ? 'No cable ties left.' : 'No velcro straps left.');
-    const cands = this.nearby(x, y, TIE_R, 3);
+    const cands = this.nearby(x, y, kind === 'zip' ? GATHER_R : TIE_R + 18, 3);
     const chosen = kind === 'zip' ? this.sameColor(cands) : cands.length >= 2 ? cands : null;
+    if (this.extendTie(x, y, kind, cands)) return true;
+    if (this.left[kind] <= 0) return this.toast(kind === 'zip' ? 'No cable ties left.' : 'No velcro straps left.');
     if (!chosen) return this.toast(kind === 'zip' ? 'Tie where 2+ cables of the SAME color run close together.' : 'Strap where 2+ cables run close together.');
     // a tie takes over the comb lanes right where it closes
     for (const t of this.ties) if (t.kind === 'comb') t.entries = t.entries.filter((e) => !chosen.some((h) => h.cable === e.cable && Math.abs(h.idx - e.idx) < 4));
     const f = this.frameOf(chosen), m = f.sorted.length;
     this.ties.push({
-      kind, x: f.cx, y: f.cy, nx: f.nx, ny: f.ny, color: chosen[0].cable.color, t: 0, tail: kind === 'zip' ? 1 : 0,
+      kind, x: f.cx, y: f.cy, nx: f.nx, ny: f.ny, color: chosen[0].cable.color, t: 0, tail: kind === 'zip' ? 1 : 0, gid: this.nextGid++,
       entries: f.sorted.map((e, k) => ({ cable: e.cable, idx: e.idx, off: (k - (m - 1) / 2) * REP_R })),
     });
+    this.orderLanes([this.ties[this.ties.length - 1]]);
     this.use(kind);
     this.wakeAll();
     this.fx.push({ x: f.cx, y: f.cy, t: 0, color: '#ffffff', kind: 'ring' });
     this.onEvent({ type: kind === 'zip' ? 'tie' : 'velcro' });
+    return true;
+  }
+
+  feedTie(kind: 'zip' | 'velcro', x: number, y: number) { return this.extendTie(x, y, kind, this.nearby(x, y, GATHER_R, 3)); }
+
+  /** Tapping by an existing tie or strap feeds in the cables that were left out. */
+  private extendTie(x: number, y: number, kind: 'zip' | 'velcro', cands: { cable: Cable; idx: number; d: number }[]): boolean {
+    const t = this.ties.find((o) => o.kind === kind && Math.hypot(o.x - x, o.y - y) < 60);
+    if (!t) return false;
+    const add = cands.filter((c) => c.d < TIE_R + 30 && !t.entries.some((e) => e.cable === c.cable) && (kind === 'velcro' || c.cable.color === t.color));
+    if (!add.length) return false;
+    for (const a of add) t.entries.push({ cable: a.cable, idx: a.idx, off: 0, t: 0 });
+    const side = (e: TieEntry) => (e.cable.x[e.idx] - t.x) * t.nx + (e.cable.y[e.idx] - t.y) * t.ny;
+    t.entries.sort((a, b) => side(a) - side(b));
+    const m = t.entries.length;
+    t.entries.forEach((e, k) => { e.off = (k - (m - 1) / 2) * REP_R; });
+    if (kind === 'zip') t.tail = 1;
+    this.orderLanes([t]);
+    this.wakeAll();
+    this.fx.push({ x: t.x, y: t.y, t: 0, color: '#ffffff', kind: 'ring' });
+    this.onEvent({ type: kind === 'zip' ? 'tie' : 'velcro' });
+    return true;
+  }
+
+  /**
+   * When every cable in a bundle is plugged at both ends, line the lanes up with the ports so the
+   * bundle itself never forces a crossing. `ts` are the stations of one holder.
+   */
+  private orderLanes(ts: Tie[]) {
+    const t = ts[0], cs = [...new Set(ts.flatMap((q) => q.entries.map((e) => e.cable)))];
+    if (!t || Math.abs(t.nx) < 0.35 || cs.some((c) => !c.ends[0].port || !c.ends[1].port)) return;
+    const key = (c: Cable) => c.ends[0].port!.x + c.ends[1].port!.x;
+    const order = cs.sort((a, b) => (key(a) - key(b)) * Math.sign(t.nx));
+    for (const q of ts) {
+      const offs = q.entries.map((e) => e.off).sort((a, b) => a - b);
+      const sorted = [...q.entries].sort((a, b) => order.indexOf(a.cable) - order.indexOf(b.cable));
+      sorted.forEach((e, k) => { if (Math.abs(e.off - offs[k]) > 0.5) { e.off = offs[k]; if (q.t >= 1) e.t = 0.3; } });
+      q.entries = sorted;
+    }
+  }
+
+  /**
+   * Tap a crossing: the cable flicks over the other one, as long as nothing holds it there.
+   * Returns false if there is no crossing at that point.
+   */
+  flick(x: number, y: number): boolean {
+    let pt: (typeof this.crossPts)[number] | null = null, bd = 30;
+    for (const p of this.crossPts) { const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; pt = p; } }
+    if (!pt) return false;
+    const { a, b } = pt;
+    let ok = false;
+    if (a === b) {
+      for (let i = 1; i < a.n - 4 && !ok; i++) for (let j = i + 3; j < a.n - 2 && !ok; j++) {
+        if (!segX(a.x[i], a.y[i], a.x[i + 1], a.y[i + 1], a.x[j], a.y[j], a.x[j + 1], a.y[j + 1]) || Math.hypot(a.x[i] - pt.x, a.y[i] - pt.y) > 30) continue;
+        let held = false;
+        for (let k = i + 1; k <= j; k++) held ||= !!a.pin[k];
+        if (held) continue;
+        this.reverse(a, i, j);
+        ok = true;
+      }
+      if (!ok) { // looped over its own plug: lay that end out straight
+        const near = Math.hypot(a.x[1] - pt.x, a.y[1] - pt.y) < Math.hypot(a.x[a.n - 2] - pt.x, a.y[a.n - 2] - pt.y);
+        const at = (k: number) => (near ? k : a.n - 1 - k);
+        let m = 2;
+        for (let k = 2; k < a.n - 6; k++) if (Math.hypot(a.x[at(k)] - pt.x, a.y[at(k)] - pt.y) < 26) m = k;
+        const end = m + 5;
+        let held = end > a.n - 4;
+        for (let k = 2; k < end && !held; k++) held = !!a.pin[at(k)];
+        if (!held) {
+          const s0 = at(1), s1 = at(end);
+          for (let k = 2; k < end; k++) { const u = (k - 1) / (end - 1), q = at(k); a.x[q] = a.px[q] = a.x[s0] + (a.x[s1] - a.x[s0]) * u; a.y[q] = a.py[q] = a.y[s0] + (a.y[s1] - a.y[s0]) * u; }
+          ok = true;
+        }
+      }
+    } else {
+      const xs = this.crossList(a, b);
+      let k = -1, d = 60;
+      xs.forEach((q, i) => { const e = Math.hypot(q.x - pt!.x, q.y - pt!.y); if (e < d) { d = e; k = i; } });
+      const pairs = [[k - 1, k], [k, k + 1]].filter(([u, v]) => u >= 0 && v < xs.length && k >= 0)
+        .sort((m, n) => (xs[m[1]].i - xs[m[0]].i) - (xs[n[1]].i - xs[n[0]].i));
+      for (const [u, v] of pairs) {
+        const p = xs[u], q = xs[v];
+        if (!this.resolve(a, b, p, q)) continue;
+        ok = true;
+        break;
+      }
+    }
+    if (!ok) { this.toast(a.color === b.color ? 'These two go to each other’s ports: swap two of their plugs.' : 'Something holds these here. Move a plug, or loosen the tie or hook.'); return true; }
+    this.wakeAll();
+    this.burst(pt.x, pt.y, 8, '#fff3a8', 110, 0, -30);
+    this.fx.push({ x: pt.x, y: pt.y, t: 0, color: '#7dffb0', kind: 'ring' });
+    this.crossPts = this.crossPts.filter((p) => p !== pt);
+    this.onEvent({ type: 'flick' });
     return true;
   }
 
@@ -1271,43 +1521,56 @@ export class Game {
     return true;
   }
 
-  wound(r: Reel) { return (r.cable.seg0 - r.cable.seg) * (r.cable.n - 1); }
+  wound(r: Reel) { return r.cable.wound; }
 
-  /** Shortest segment length that still reaches every held node (plus a hair of natural sag). */
-  private minSeg(c: Cable) {
-    const floor = c.seg0 * 0.42;
-    let last = -1, m = floor;
-    for (let i = 0; i < c.n; i++) {
-      if (!c.pin[i]) continue;
-      if (last >= 0 && i - last > 1) m = Math.max(m, (Math.hypot(c.x[i] - c.x[last], c.y[i] - c.y[last]) / (i - last)) * 1.012);
-      last = i;
-    }
-    return Math.min(c.seg0, m);
+  /** Change how much cable is on the reel; the rest of the cord absorbs the difference evenly. */
+  private setWound(c: Cable, w: number) {
+    w = clamp(w, 0, c.length * 0.58);
+    const k = (c.length - w) / (c.length - c.wound);
+    for (let i = 0; i < c.n - 1; i++) c.len[i] *= k;
+    c.wound = w;
+    c.measure();
   }
 
   private wind(r: Reel, dt: number) {
     const c = r.cable;
-    if (r.tight) return;
-    const min = this.minSeg(c);
     this.wake(c);
-    if (c.seg <= min + 0.01) {
-      r.tight = true; r.pop = 1;
-      this.fx.push({ x: c.x[r.idx], y: c.y[r.idx], t: 0, color: '#fff3a8', kind: 'spark' });
-      this.onEvent({ type: 'windTight' });
-      return;
+    // slack of every stretch, on both sides of whatever holds the cable
+    let slack = 0;
+    const st: { p: number; q: number; s: number }[] = [];
+    for (const sp of this.spans(c)) {
+      if (sp.rigid) continue;
+      const len = c.cum[sp.q] - c.cum[sp.p];
+      const s = Math.max(0, sp.held ? len - sp.d * 1.004 - 0.5 : len - (sp.q - sp.p) * 5.5);
+      slack += s; st.push({ p: sp.p, q: sp.q, s });
     }
-    const before = c.seg;
+    const room = c.length * 0.58 - c.wound;
+    if (slack < 2 || room < 1) {
+      if (!r.tight) {
+        r.tight = true; r.pop = 1;
+        this.fx.push({ x: c.x[r.idx], y: c.y[r.idx], t: 0, color: '#fff3a8', kind: 'spark' });
+        this.onEvent({ type: 'windTight' });
+      }
+      if (slack < 0.6) return;
+    } else if (slack > 12) r.tight = false;
     const ease = 0.35 + 0.65 * clamp((this.grab!.t - 0.16) / 0.5, 0, 1); // spins up
-    c.seg = Math.max(min, c.seg - (WIND_V * ease * dt) / (c.n - 1));
-    r.spin += dt * 16 * ease;
-    r.acc += (before - c.seg) * (c.n - 1);
-    if (r.acc > 11) { r.acc = 0; this.onEvent({ type: 'wind', k: (c.seg0 - c.seg) / (c.seg0 * 0.58) }); }
+    const amt = Math.min(slack, room, WIND_V * ease * dt, Math.max(0.3, slack * 0.15));
+    for (const e of st) {
+      const len = c.cum[e.q] - c.cum[e.p], k = 1 - (amt * e.s) / slack / len;
+      for (let i = e.p; i < e.q; i++) c.len[i] *= k;
+    }
+    c.wound += amt;
+    c.measure();
+    if (r.tight) return;
+    r.spin += (amt / dt / WIND_V) * dt * 16 + dt * 4;
+    r.acc += amt;
+    if (r.acc > 11) { r.acc = 0; this.onEvent({ type: 'wind', k: c.wound / (c.length * 0.58) }); }
   }
 
   private tapReel(r: Reel) {
     const c = r.cable;
     r.tight = false;
-    if (c.seg < c.seg0 - 0.05) { c.seg = c.seg0; r.pop = 1; this.onEvent({ type: 'unspool' }); return; }
+    if (c.wound > 1) { this.setWound(c, 0); r.pop = 1; this.onEvent({ type: 'unspool' }); return; }
     this.reels = this.reels.filter((o) => o !== r);
     this.IM[c.o + r.idx] = 1;
     this.giveBack('reel');
@@ -1334,17 +1597,19 @@ export class Game {
   private startRun(kind: 'comb' | 'wrap', x: number, y: number): Run | null {
     for (const t of this.ties) if (t.run && (t === t.run.stations[0] || t === t.run.stations[t.run.stations.length - 1]) && Math.hypot(t.x - x, t.y - y) < 24) return null;
     if (this.left[kind] <= 0) { this.toast(kind === 'wrap' ? 'No spiral wrap left.' : 'No combs left.'); return null; }
-    const cands = this.nearby(x, y, kind === 'comb' ? COMB_R : TIE_R, 3).filter((e) => kind === 'comb' || !this.ties.some((t) => t.kind === 'wrap' && t.entries.some((q) => q.cable === e.cable)));
+    const cands = this.nearby(x, y, kind === 'comb' ? COMB_R : GATHER_R, 3).filter((e) => kind === 'comb' || !this.ties.some((t) => t.kind === 'wrap' && t.entries.some((q) => q.cable === e.cable)));
     const chosen = kind === 'wrap' ? this.sameColor(cands) : cands.length >= 2 ? cands.sort((a, b) => a.d - b.d).slice(0, 10) : null;
     if (!chosen) { this.toast(kind === 'wrap' ? 'Start the wrap on 2+ cables of the SAME color.' : 'Start combing where 2+ cables run close together.'); return null; }
-    const f = this.frameOf(chosen), m = f.sorted.length, sp = kind === 'comb' ? COMB_LANE : WRAP_LANE;
-    const run: Run = { kind, color: chosen[0].cable.color, stations: [], ux: 0, uy: 0, ended: false, live: f.sorted.map((e, k) => ({ cable: e.cable, idx: e.idx, s: 0, lane: (k - (m - 1) / 2) * sp })) };
+    const f = this.frameOf(chosen), m = f.sorted.length, side = (e: { cable: Cable; idx: number }) => (e.cable.x[e.idx] - f.cx) * f.nx + (e.cable.y[e.idx] - f.cy) * f.ny;
+    // the comb keeps the cables about as spread out as it found them, just perfectly even
+    const sp = kind === 'comb' ? clamp(((side(f.sorted[m - 1]) - side(f.sorted[0])) / (m - 1)) * 0.85, COMB_LANE, 30) : WRAP_LANE;
+    const run: Run = { kind, gid: this.nextGid++, color: chosen[0].cable.color, stations: [], ux: 0, uy: 0, ended: false, live: f.sorted.map((e, k) => ({ cable: e.cable, idx: e.idx, s: 0, lane: (k - (m - 1) / 2) * sp })) };
     this.addStation(run, f.cx, f.cy, f.nx, f.ny);
     return run;
   }
 
   private addStation(run: Run, x: number, y: number, nx: number, ny: number) {
-    const t: Tie = { kind: run.kind, x, y, nx, ny, color: run.color, t: 0, tail: 0, run, entries: [] };
+    const t: Tie = { kind: run.kind, x, y, nx, ny, color: run.color, t: 0, tail: 0, run, gid: run.gid, entries: [] };
     for (const l of run.live) {
       const clash = this.ties.some((o) => o.run !== run && o.entries.some((e) => e.cable === l.cable && Math.abs(e.idx - l.idx) < 2));
       if (!clash) t.entries.push({ cable: l.cable, idx: l.idx, off: l.lane });
@@ -1357,8 +1622,10 @@ export class Game {
     const nodes = run.kind === 'comb' ? 2 : 1;
     for (let guard = 0; guard < 6 && !run.ended; guard++) {
       const L = run.stations[run.stations.length - 1];
-      const seg = Math.min(...run.live.map((l) => l.cable.seg));
-      const step = seg * nodes * 0.985;
+      const step = Math.max(6, Math.min(...run.live.map((l) => {
+        const to = clamp(l.idx + (l.s || 1) * nodes, 0, l.cable.n - 1);
+        return Math.abs(l.cable.cum[to] - l.cable.cum[l.idx]);
+      }))) * 0.985;
       let vx = x - L.x, vy = y - L.y;
       const d = Math.hypot(vx, vy);
       if (d < step) return;
@@ -1392,7 +1659,7 @@ export class Game {
         let j = l.idx + l.s;
         while (j >= 0 && j < l.cable.n && !l.cable.pin[j]) j += l.s;
         if (j < 0 || j >= l.cable.n) continue;
-        if (Math.hypot(ex - l.cable.x[j], ey - l.cable.y[j]) > Math.abs(j - l.idx) * l.cable.seg * 1.004 + 2) return;
+        if (Math.hypot(ex - l.cable.x[j], ey - l.cable.y[j]) > Math.abs(l.cable.cum[j] - l.cable.cum[l.idx]) * 1.004 + 2) return;
       }
       run.live = nl; run.ux = vx; run.uy = vy;
       this.addStation(run, cx, cy, nx, ny);
@@ -1406,6 +1673,7 @@ export class Game {
       this.toast(run.kind === 'comb' ? 'Keep dragging along the cables to comb them.' : 'Keep dragging along the bundle to wrap it.');
       return;
     }
+    this.orderLanes(run.stations);
     this.use(run.kind);
     const e = run.stations[run.stations.length - 1];
     this.fx.push({ x: e.x, y: e.y, t: 0, color: '#fff3a8', kind: 'spark' });
@@ -1523,7 +1791,7 @@ export class Game {
   }
 
   ductCable(d: Duct, c: Cable, idx: number): boolean {
-    const k = this.ductSpan(d, c);
+    const k = Math.max(3, Math.ceil((d.st[1].y - d.st[0].y) / c.seg - 0.15));
     if (c.n < 2 * k + 8) return this.toast('That cable is too short for the duct.');
     idx = clamp(idx, k + 3, c.n - 4 - k);
     // the station nearer the cable's upper end comes first
@@ -1563,72 +1831,136 @@ export class Game {
   /** Re-sort hook / duct lanes after plugs changed. */
   private relayout() {
     for (const h of this.hooks) this.layout(h.tie, 8);
+    const seen = new Set<number>();
+    for (const t of this.ties) {
+      if (t.kind === 'hook' || t.kind === 'duct' || seen.has(t.gid)) continue;
+      seen.add(t.gid);
+      this.orderLanes(this.ties.filter((o) => o.gid === t.gid));
+    }
+    for (const d of this.ducts) for (const e of d.st[0].entries) {
+      // laid in before its ends were plugged and now upside down: turn it around
+      const c = e.cable, o = d.st[2].entries.find((q) => q.cable === c)!, p0 = c.ends[0].port, p1 = c.ends[1].port;
+      const up = p0 ? p0.y < d.y : p1 ? p1.y > d.y : e.idx < o.idx; // does node 0 belong at the top?
+      if (up !== e.idx < o.idx) { const i = e.idx; e.idx = o.idx; o.idx = i; e.t = o.t = 0.1; }
+    }
     for (const d of this.ducts) for (const t of d.st) this.layout(t, Math.min(13, (d.w - 24) / Math.max(1, t.entries.length - 1)));
   }
 
-  /** Cables slip through hooks and ducts until the slack on both sides evens out. */
-  private slideAll() {
-    for (const h of this.hooks) for (const e of h.tie.entries) this.slide([e]);
-    for (const d of this.ducts) for (const e of d.st[0].entries) {
-      const es = d.st.map((t) => t.entries.find((q) => q.cable === e.cable)!);
-      if (this.frame % 4 === 0 && es.every((q) => (q.t ?? 1) >= 1)) this.swallow(d, es);
-      this.slide(es);
+  /**
+   * Stretches of cable between held nodes. `rigid`: both ends gripped by the same unit (inside a
+   * run or duct, or the two pinned nodes of a plug). `held` is false for a loose end.
+   */
+  private spans(c: Cable) {
+    const out: { p: number; q: number; d: number; rigid: boolean; held: boolean; duct: Duct | null }[] = [];
+    let last = -1;
+    for (let i = 0; i < c.n; i++) {
+      if (!c.pin[i]) continue;
+      if (last < 0) { if (i > 0) out.push({ p: 0, q: i, d: 0, rigid: false, held: false, duct: null }); } else {
+        const plug = (last === 0 && i === 1 && !!c.ends[0].port) || (last === c.n - 2 && i === c.n - 1 && !!c.ends[1].port);
+        const same = c.grp[last] !== 0 && c.grp[last] === c.grp[i];
+        const duct = same ? this.ducts.find((d) => d.st[0].gid === c.grp[i]) ?? null : null;
+        out.push({ p: last, q: i, d: Math.hypot(c.x[i] - c.x[last], c.y[i] - c.y[last]), rigid: plug || same, held: true, duct });
+      }
+      last = i;
     }
+    if (last < 0) out.push({ p: 0, q: c.n - 1, d: 0, rigid: false, held: false, duct: null });
+    else if (last < c.n - 1) out.push({ p: last, q: c.n - 1, d: 0, rigid: false, held: false, duct: null });
+    return out;
   }
 
-  /** A closed duct pulls the spare cable inside, out of sight; opening the lid lets it out again. */
-  private swallow(d: Duct, es: TieEntry[]) {
-    const c = es[0].cable, k = this.ductSpan(d, c);
-    if (this.grab && this.isGrabbed(c)) return;
-    for (const e of [es[0], es[2]]) {
-      const s = Math.sign(e.idx - es[1].idx), inside = Math.abs(e.idx - es[1].idx);
-      let j = e.idx + s;
-      while (j >= 0 && j < c.n && !c.pin[j]) j += s;
-      const held = j >= 0 && j < c.n;
-      const slack = held ? Math.abs(j - e.idx) * c.seg - Math.hypot(c.x[j] - c.x[e.idx], c.y[j] - c.y[e.idx]) : 0;
-      let move = 0;
-      if (d.lid >= 1 && held && slack > 1.15 * c.seg && inside < k + 14) move = s;
-      else if (inside > k && (d.lid < 1 || slack < 0.02 * c.seg)) move = -s;
-      const to = e.idx + move;
-      if (!move || to < 3 || to > c.n - 4) continue;
-      const tx = c.x[e.idx], ty = c.y[e.idx];
-      e.idx = to;
-      c.x[to] = c.px[to] = tx; c.y[to] = c.py[to] = ty;
-      this.computePins();
-      this.wake(c);
-      if (move === s) this.onEvent({ type: 'payout' });
+  /**
+   * Ties, hooks, wraps, combs and ducts guide a cable but don't clamp it: cable slips through them
+   * until the slack is shared by all the stretches, so it can't get stuck as a loop on one side
+   * while the other side is taut. Moves rest length between stretches; the total never changes.
+   * The player's hand does clamp: nothing slips past a grabbed point.
+   */
+  private balance(c: Cable) {
+    c.grp.fill(0);
+    let soft = false;
+    for (const t of this.ties) for (const e of t.entries) if (e.cable === c) {
+      if (t.t >= 1 && (e.t ?? 1) >= 1) c.grp[e.idx] = t.gid; else soft = true;
     }
+    const sp = this.spans(c);
+    const g = this.grab, hand = g?.kind === 'cable' && g.cable === c && !g.hold ? g.idx! : -1;
+    const want = sp.map((s) => c.cum[s.q] - c.cum[s.p]);
+    const cur = want.slice();
+    for (let a = 0; a < sp.length;) {
+      if (!sp[a].held) { a++; continue; }
+      let b = a;
+      while (b + 1 < sp.length && sp[b + 1].held && sp[b].q !== hand) b++;
+      // chain a..b
+      let pool = 0, D = 0;
+      for (let k = a; k <= b; k++) {
+        if (sp[k].rigid) { pool += cur[k] - sp[k].d; want[k] = sp[k].d; } else { pool += cur[k]; D += sp[k].d; }
+      }
+      if (D > 1) {
+        // a closed duct pulls the spare cable inside
+        let spare = pool - D * 1.006 - 2;
+        const inside = sp.filter((q, k) => k >= a && k <= b && q.duct && q.duct.lid >= 1).length;
+        const each = spare / Math.max(1, inside);
+        for (let k = a; k <= b && spare > 0; k++) if (sp[k].duct && sp[k].duct!.lid >= 1) {
+          const take = Math.min(each, sp[k].d * 1.2);
+          want[k] += take; spare -= take; pool -= take;
+        }
+        // taut: let a loose end feed in through the holder
+        for (const l of [a - 1, b + 1]) if (pool < D && sp[l] && !sp[l].held && (l < a ? sp[a].p : sp[b].q) !== hand) {
+          const feed = Math.min(D - pool, 5, Math.max(0, cur[l] - 40));
+          want[l] -= feed; pool += feed;
+        }
+        for (let k = a; k <= b; k++) if (!sp[k].rigid) want[k] = (sp[k].d / D) * pool;
+      } else for (let k = a; k <= b; k++) want[k] = cur[k];
+      a = b + 1;
+    }
+    let m = 0;
+    for (let k = 0; k < sp.length; k++) m = Math.max(m, Math.abs(want[k] - cur[k]));
+    const f = m > 0.02 ? Math.min(0.5, 10 / m) : 0;
+    for (let k = 0; k < sp.length; k++) {
+      const { p, q } = sp[k], to = Math.max(1, cur[k] + (want[k] - cur[k]) * f), mean = to / (q - p), r = to / cur[k];
+      for (let i = p; i < q; i++) c.len[i] = c.len[i] * r * 0.9 + mean * 0.1; // and even out inside the stretch
+    }
+    c.measure();
+    if (!soft && hand < 0 && this.frame % 6 === 0) this.renode(c, sp);
   }
 
-  private ductSpan(d: Duct, c: Cable) { return Math.ceil((d.st[1].y - d.st[0].y) / c.seg - 0.15); }
-
-  private slide(es: TieEntry[]) {
-    const c = es[0].cable;
-    if (es.some((e) => (e.t ?? 1) < 1)) return;
-    const lo = Math.min(...es.map((e) => e.idx)), hi = Math.max(...es.map((e) => e.idx));
-    const side = (from: number, s: 1 | -1) => {
-      let j = from + s;
-      while (j >= 0 && j < c.n && !c.pin[j]) j += s;
-      if (j < 0 || j >= c.n) return { arc: Math.abs((s < 0 ? 0 : c.n - 1) - from) * c.seg, d: 0, j: -1 };
-      return { arc: Math.abs(j - from) * c.seg, d: Math.hypot(c.x[j] - c.x[from], c.y[j] - c.y[from]), j };
-    };
-    const a = side(lo, -1), b = side(hi, 1);
-    const slackA = a.arc - a.d, slackB = b.arc - b.d;
-    if (a.j < 0 && b.j < 0) return;
-    let move = 0;
-    if (slackA < 4 && slackB > 4 + 2.4 * c.seg) move = 1;
-    else if (slackB < 4 && slackA > 4 + 2.4 * c.seg) move = -1;
-    else if (a.j >= 0 && b.j >= 0 && slackA - slackB > 2.3 * c.seg) move = -1;
-    else if (a.j >= 0 && b.j >= 0 && slackB - slackA > 2.3 * c.seg) move = 1;
-    if (!move || lo + move < 3 || hi + move > c.n - 4) return;
-    if (this.grab?.cable === c && this.grab.idx !== undefined && this.grab.idx >= lo - 2 && this.grab.idx <= hi + 2) return;
-    for (const e of es) {
-      const tx = c.x[e.idx], ty = c.y[e.idx];
-      e.idx += move;
-      c.x[e.idx] = c.px[e.idx] = tx; c.y[e.idx] = c.py[e.idx] = ty;
+  /** Keep nodes evenly spread: if a stretch got much longer or shorter, re-index who holds what. */
+  private renode(c: Cable, sp: { p: number; q: number; rigid: boolean; held: boolean }[]) {
+    if (sp.length < 2 || this.grab?.kind === 'run') return;
+    const len = sp.map((s) => c.cum[s.q] - c.cum[s.p]), free = sp.map((s) => !s.rigid);
+    let L = 0, N = 0;
+    sp.forEach((s, k) => { if (free[k]) { L += len[k]; N += s.q - s.p; } });
+    const avg = L / N;
+    if (!sp.some((s, k) => free[k] && (len[k] / (s.q - s.p) > avg * 1.3 || len[k] / (s.q - s.p) < avg * 0.72) && Math.abs(len[k] / avg - (s.q - s.p)) > 1.2)) return;
+    const cnt = sp.map((s, k) => (free[k] ? Math.max(2, Math.round(len[k] / avg)) : s.q - s.p));
+    let diff = c.n - 1 - cnt.reduce((a, b) => a + b, 0);
+    while (diff !== 0) { // fix rounding on the biggest stretch
+      let b = -1;
+      free.forEach((f, k) => { if (f && (b < 0 || cnt[k] > cnt[b])) b = k; });
+      if (b < 0 || (diff < 0 && cnt[b] <= 2)) return;
+      cnt[b] += Math.sign(diff); diff -= Math.sign(diff);
     }
+    if (cnt.every((n, k) => n === sp[k].q - sp[k].p)) return;
+    const ox = c.x.slice(), oy = c.y.slice(), opx = c.px.slice(), opy = c.py.slice(), map = new Map<number, number>();
+    const reels = this.reels.filter((r) => r.cable === c);
+    let at = 0;
+    const reelTo = new Map<Reel, number>();
+    sp.forEach((s, k) => {
+      const m0 = s.q - s.p, m1 = cnt[k];
+      map.set(s.p, at); map.set(s.q, at + m1);
+      for (let i = 0; i <= m1; i++) { // resample the same polyline: nothing visibly moves
+        const u = s.p + (i / m1) * m0, j = Math.min(s.q - 1, Math.floor(u)), w = u - j;
+        c.x[at + i] = ox[j] + (ox[j + 1] - ox[j]) * w; c.y[at + i] = oy[j] + (oy[j + 1] - oy[j]) * w;
+        c.px[at + i] = opx[j] + (opx[j + 1] - opx[j]) * w; c.py[at + i] = opy[j] + (opy[j + 1] - opy[j]) * w;
+        if (i < m1) c.len[at + i] = len[k] / m1;
+      }
+      for (const r of reels) if (r.idx >= s.p && r.idx < s.q) reelTo.set(r, at + clamp(Math.round(((r.idx - s.p) / m0) * m1), m1 > 1 ? 1 : 0, Math.max(0, m1 - 1)));
+      at += m1;
+    });
+    for (const t of this.ties) for (const e of t.entries) if (e.cable === c) e.idx = map.get(e.idx) ?? e.idx;
+    for (const [r, i] of reelTo) { this.IM[c.o + r.idx] = 1; r.idx = i; }
+    for (const r of reels) this.IM[c.o + r.idx] = 0.5;
+    c.measure();
     this.computePins();
-    this.wake(c);
+    for (const t of this.ties) for (const e of t.entries) if (e.cable === c) c.grp[e.idx] = t.gid;
   }
 
   // ---- finishing touches
@@ -1647,7 +1979,7 @@ export class Game {
   countCrossings(): number {
     let total = 0;
     this.crossPts = [];
-    const hidden = (x: number, y: number) => !!this.inClosedDuct(x, y);
+    const hidden = (x: number, y: number) => !!this.inClosedDuct(x, y, 18);
     const cs = this.cables;
     const bb = cs.map((c) => {
       let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
@@ -1665,7 +1997,7 @@ export class Game {
         for (let j = i + 3; j < c.n - 1 && !hit; j++) {
           hit = segX(c.x[i], c.y[i], c.x[i + 1], c.y[i + 1], c.x[j], c.y[j], c.x[j + 1], c.y[j + 1]);
         }
-        if (hit && !hidden(c.x[i], c.y[i])) { if (i - last > 3) { total++; this.crossPts.push({ x: c.x[i], y: c.y[i] }); } last = i; }
+        if (hit && !hidden(c.x[i], c.y[i])) { if (i - last > 3) { total++; this.crossPts.push({ x: c.x[i], y: c.y[i], a: c, b: c }); } last = i; }
       }
     }
     for (let a = 0; a < cs.length; a++) for (let b = a + 1; b < cs.length; b++) {
@@ -1673,7 +2005,7 @@ export class Game {
       if (A.x1 < B.x0 || B.x1 < A.x0 || A.y1 < B.y0 || B.y1 < A.y0) continue;
       const ca = cs[a], cb = cs[b];
       // twists inside one tied bundle of the same color are fine
-      if (ca.color === cb.color && this.ties.some((t) => (t.kind === 'zip' || t.kind === 'velcro' || t.kind === 'wrap') && t.entries.some((e) => e.cable === ca) && t.entries.some((e) => e.cable === cb))) continue;
+      if (ca.color === cb.color && this.ties.some((t) => t.kind !== 'comb' && t.entries.some((e) => e.cable === ca) && t.entries.some((e) => e.cable === cb))) continue;
       const hits: number[] = [];
       for (let i = 0; i < ca.n - 1; i++) {
         for (let j = 0; j < cb.n - 1; j++) {
@@ -1681,7 +2013,7 @@ export class Game {
         }
       }
       let last = -99;
-      for (const h of hits) { if (hidden(ca.x[h], ca.y[h])) continue; if (h - last > 3) { total++; this.crossPts.push({ x: ca.x[h], y: ca.y[h] }); } last = h; }
+      for (const h of hits) { if (hidden(ca.x[h], ca.y[h])) continue; if (h - last > 3) { total++; this.crossPts.push({ x: ca.x[h], y: ca.y[h], a: ca, b: cb }); } last = h; }
     }
     return total;
   }
@@ -1767,6 +2099,19 @@ export class Game {
 
 function bit(x: number, y: number, vx: number, vy: number, w: number, h: number, color: string, life: number, g: number): Bit {
   return { x, y, vx, vy, rot: Math.random() * 6, vr: (Math.random() - 0.5) * 16, w, h, color, t: 0, life, g };
+}
+
+/** Point at fraction k of a polyline's length. */
+function along(P: number[][], k: number) {
+  let L = 0;
+  for (let i = 1; i < P.length; i++) L += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+  let t = L * k;
+  for (let i = 1; i < P.length; i++) {
+    const d = Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+    if (t <= d || i === P.length - 1) { const u = d ? t / d : 0; return [P[i - 1][0] + (P[i][0] - P[i - 1][0]) * u, P[i - 1][1] + (P[i][1] - P[i - 1][1]) * u]; }
+    t -= d;
+  }
+  return P[0];
 }
 
 export function clamp(v: number, a: number, b: number) { return v < a ? a : v > b ? b : v; }

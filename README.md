@@ -25,6 +25,7 @@ npm run build     # type-check (tsc) + production build into dist/
 npm run preview   # serve the production build
 # tip: add ?all to the URL to unlock every job for review
 npm run test:physics  # headless physics rest test on every level
+npm run test:tangle   # messy play-throughs: what is left tangled, slack stuck beside bundles
 npm run test:tools    # plug grabbing, every tool/fixture, 3 stars reachable on every job
 ```
 
@@ -41,6 +42,8 @@ Requires Node 20+.
 | Zip tie, velcro, reel, label | click (dragging still moves cables) | tap |
 | Wind a reel / let it out | hold it / click it | hold / tap |
 | Snip a tie's tail, then remove it | click, click again | tap, tap again |
+| Flick a crossing loose (yellow ring, once all is connected) | click it | tap it |
+| Add a missed cable to a tie / strap | tie tool, click by the tie | same |
 | Comb, spiral wrap, duster, driver | press and drag / hold | same |
 | Hook or duct | drop a cable on it; drag the LID handle down | same |
 

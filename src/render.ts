@@ -1,4 +1,4 @@
-import { Game, W, H, FLOOR, PLUG_LEN, REP_R, TIE_R, COMB_R, AIR_R, REEL_R, Cable, End, Port, Tie, Run, Reel, Hook, Duct, clamp } from './game';
+import { Game, W, H, FLOOR, PLUG_LEN, REP_R, TIE_R, GATHER_R, COMB_R, AIR_R, REEL_R, Cable, End, Port, Tie, Run, Reel, Hook, Duct, clamp } from './game';
 import type { ToolId } from './tools';
 import { COLORS, DeviceDef, Theme } from './levels';
 import { drawBadge, drawStatusLed, type LedState } from './symbols';
@@ -574,7 +574,7 @@ function drawReel(ctx: C2D, g: Game, r: Reel, hi: boolean) {
   const c = r.cable, x = c.x[r.idx], y = c.y[r.idx], col = COLORS[c.color];
   const held = g.grab?.reel === r;
   const s = 1 + Math.sin(r.pop * Math.PI) * 0.22 + (held ? 0.06 : 0);
-  const k = clamp((c.seg0 - c.seg) / (c.seg0 * 0.58), 0, 1);
+  const k = clamp(c.wound / (c.length * 0.58), 0, 1);
   ctx.save();
   ctx.translate(x, y); ctx.scale(s, s);
   ctx.beginPath(); ctx.arc(3, 5, REEL_R + 2, 0, Math.PI * 2); ctx.fillStyle = 'rgba(0,0,0,0.28)'; ctx.fill();
@@ -647,7 +647,8 @@ function drawToolCursor(ctx: C2D, g: Game, tool: ToolId) {
     ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
     ctx.setLineDash([]);
   };
-  if ((tool === 'zip' || tool === 'velcro' || (tool === 'wrap' && g.grab?.kind !== 'run')) && !g.grab) ring(TIE_R);
+  if ((tool === 'zip' || tool === 'wrap') && !g.grab) ring(GATHER_R);
+  if (tool === 'velcro' && !g.grab) ring(TIE_R + 18);
   if (tool === 'reel' && !g.grab) ring(30);
   if (tool === 'label' && !g.grab) ring(26);
   if (tool === 'comb' && g.grab?.kind !== 'run') {
@@ -711,7 +712,12 @@ export function drawScene(ctx: C2D, g: Game, opts: DrawOpts) {
   for (const c of g.order) { cablePath(ctx, c, 3, 5); ctx.stroke(); }
 
   const litCable = hover?.kind === 'cable' ? hover.cable : null;
-  for (const c of g.order) {
+  // cables on a hook go behind its bar, the rest pass in front of it
+  const onHook = new Set(g.hooks.flatMap((h) => h.tie.entries.map((e) => e.cable)));
+  const layered = [...g.order].sort((a, b) => Number(onHook.has(b)) - Number(onHook.has(a)));
+  let bars = false;
+  for (const c of layered) {
+    if (!bars && !onHook.has(c)) { bars = true; for (const h of g.hooks) if (h.tie.entries.length) drawHook(ctx, h, true, false); }
     if (c === litCable) { ctx.strokeStyle = 'rgba(255,243,168,0.55)'; ctx.lineWidth = 16; cablePath(ctx, c); ctx.stroke(); }
     drawCable(ctx, c, wire, g.isGrabbed(c));
   }
@@ -731,7 +737,7 @@ export function drawScene(ctx: C2D, g: Game, opts: DrawOpts) {
     if (run.stations[0].entries.length) drawCombPiece(ctx, run.stations[0], lanes(run.stations[0]), hi, false);
     if (active || last.entries.length) drawCombPiece(ctx, last, lanes(last), hi || active, active);
   }
-  for (const h of g.hooks) if (h.tie.entries.length) drawHook(ctx, h, true, false);
+  if (!bars) for (const h of g.hooks) if (h.tie.entries.length) drawHook(ctx, h, true, false);
   for (const d of g.ducts) drawDuct(ctx, g, d, true, false, ui);
   for (const tie of g.ties) if (tie.kind === 'zip' || tie.kind === 'velcro') drawTie(ctx, tie, ui && tie === heldTie);
   for (const r of g.reels) drawReel(ctx, g, r, ui && ((hover?.kind === 'reel' && hover.reel === r) || gr?.reel === r));

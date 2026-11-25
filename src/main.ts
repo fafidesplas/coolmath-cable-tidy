@@ -362,6 +362,7 @@ function onGameEvent(e: GameEvent) {
     case 'grab': sfx.sfxGrab(); break;
     case 'strain': sfx.sfxStrain(); sfx.buzz(15); break;
     case 'tie': sfx.sfxZip(); sfx.buzz([6, 20, 6, 20, 6, 20, 14]); break;
+    case 'flick': sfx.sfxPop(); sfx.buzz(14); break;
     case 'trim': sfx.sfxTrim(); sfx.buzz([8, 20, 14]); break;
     case 'snip': sfx.sfxSnip(); sfx.buzz(10); break;
     case 'velcro': sfx.sfxVelcro(); sfx.buzz([8, 10, 8, 10, 20]); break;
@@ -389,7 +390,7 @@ function onGameEvent(e: GameEvent) {
     case 'allgood':
       setTimeout(() => sfx.sfxDone(), 250);
       sfx.buzz([30, 60, 30]);
-      hint('Everything is connected! Tidy up, then press “Power on”.', 5000);
+      hint('Everything is connected! Tap a yellow ring to flick a crossing loose, then press “Power on”.', 5000);
       break;
     case 'broken': break;
     case 'toast': sfx.sfxError(); toast(e.text); break;
@@ -435,6 +436,8 @@ const up = (e: PointerEvent) => {
   pointerId = null;
   sfx.airOff();
   const k = game.grab?.kind;
+  // near an existing tie the tool first feeds in cables that were left out
+  if (pressed && game.grab?.kind === 'tie' && (tool === 'zip' || tool === 'velcro') && game.feedTie(tool, pressed.x, pressed.y)) { game.cancelGrab(); pressed = null; updateHud(); updateMeter(); return; }
   const fixture = k === 'tie' || k === 'reel' || k === 'lid';
   if (pressed && performance.now() - pressed.t < 450 && !fixture) {
     game.cancelGrab();
