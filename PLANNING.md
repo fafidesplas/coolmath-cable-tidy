@@ -67,13 +67,32 @@ Read client brief → Untangle & connect (LEDs go green) → Tidy (ties, smooth 
 - The tie gathers those cables (ordered by their current side-by-side position to avoid twisting) and zips them into a neat parallel bundle with a ratchet sound.
 - Ties can be dragged to slide the bundle; tap a tie to snip it and get it back.
 
+### 4.3b Tools of the trade (Nov 2026)
+Tap tools act on a tap and a drag still moves cables, so there is no mode friction.
+
+| Tool | What it does | The satisfying bit |
+|---|---|---|
+| Zip tie | Gathers one color; tap again to snip the tail | Ratchet, then a crisp snip and the tail flies off |
+| Velcro | Gathers any colors, reusable | Rrrrip on removal |
+| Spiral wrap | Drag along a same-color bundle | Rising ticks as the tube winds on |
+| Reel | Clip on a long cable, hold to wind, tap to release; pays out when pulled | Accelerating ratchet, thunk when taut |
+| Comb | Drag across cables: parallel lanes | Cables fall into place behind the comb |
+| Label maker | Tap a working cable | Printer chatter, label wraps on |
+| Air duster | Hold and sweep | Hiss, fluff flies, loose cables flutter |
+| Screwdriver | Hold on a terminal | Spin, bite, brass screw |
+| Hook (fixture) | Drop a cable on it; it slips through until slack evens out | Click, capacity dots |
+| Duct (fixture) | Drop cables in, zip the lid down | Finger-by-finger clicks; slack is sucked inside |
+
+Plug heads: 44–64 px grab radius (scaled to the screen), preference for loose/wrong heads, pull 18 px to pop (44 px if screwed), 60 px magnet with a bias to matching ports.
+
 ### 4.4 Tidiness score (0–100) and stars
 | Metric | Weight | How it's measured |
 |---|---|---|
 | Connections | 10 | valid cables / total (all required to finish) |
-| Crossings | 40 | crossings between cables + self-loops (−20% each). Twists inside one tied same-color bundle don't count |
+| Crossings | 35 | crossings between cables + self-loops (−20% each). Twists inside one tied same-color bundle don't count |
 | Smooth runs | 25 | total turning angle along each cable (loops, zig-zags, slack) + cable lying on the floor |
-| Color bundles | 25 | for each color with 2+ cables, share of them gathered by one tie |
+| Color bundles | 18 | for each color with 2+ cables, share of them gathered by one tie, strap, wrap or closed duct |
+| Finishing touches | 12 | dust, labels, screws, duct lid, trimmed ties (only those the job has) |
 
 Stars: 1★ = finished, 2★ ≥ 75, 3★ ≥ 90. Live tidy meter in the HUD.
 
@@ -83,14 +102,16 @@ Stars: 1★ = finished, 2★ ≥ 75, 3★ ≥ 90. Live tidy meter in the HUD.
 
 ## 5. Progression & content
 
-### Prototype (this repo): 5 jobs
+### Prototype (this repo): 7 jobs
 | # | Job | Tier | Cables | Colors | Ties | New idea |
 |---|---|---|---|---|---|---|
-| 1 | Grandma Rosa's Router | Home router | 3 | 2 | 1 | Basic drag & snap |
-| 2 | Byte Me Café | Home router | 5 | 3 | 2 | Cable ties |
-| 3 | Sparky Workshop Panel | Electrical panel | 6 | 3 | 3 | Wires & breakers flip ON |
-| 4 | Pixel Pals Studio | Network rack | 8 | 3 | 3 | Patch panel → switch |
-| 5 | Cloud Nine Datacenter | Datacenter rack | 10 | 4 | 4 | Two servers, 4 bundles |
+| 1 | Grandma Rosa's Router | Home router | 3 | 2 | zip 1 | Drag & snap, air duster |
+| 2 | Byte Me Café | Home router | 5 | 3 | zip 2 | Zip ties + snipping |
+| 3 | Nina's Streaming Desk | Home office | 5 | 3 | zip 2 | Reels, hooks, cables that are too long |
+| 4 | Sparky Workshop Panel | Electrical panel | 6 | 3 | zip 3 | Duct with lid, terminal screws |
+| 5 | Pixel Pals Studio | Network rack | 8 | 3 | velcro 3 | Comb, velcro, labels |
+| 6 | Radio Luna | Broadcast booth | 7 | 3 | wrap 3 | Spiral wrap |
+| 7 | Cloud Nine Datacenter | Datacenter rack | 10 | 4 | velcro 2, wrap 2 | Everything together |
 
 ### Full game (proposal): 3 worlds × 10 jobs + bonus
 1. **Home & Small Business** – routers, TVs, game consoles, printers, café POS. Introduces drag, snap, ties.

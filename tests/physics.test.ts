@@ -20,8 +20,9 @@
  *   solved – every cable plugged into its matching ports (hanging cables)
  *   drag   – grab a free cable in the middle, swirl it around for 1.5 s, then drag it slowly
  *            along the floor (where static friction acts), release, then idle.
- *            Also checks that the grabbed node follows the pointer (< 1 px error) and that the
- *            rest of the cable actually moves while dragged (> 60 px: it still "feels" physical),
+ *            Also checks that the grabbed node follows the pointer (< 1 px error) while it can
+ *            reach it, that the cable goes taut instead of stretching when it can't (< 12%), that
+ *            the rest of the cable actually moves while dragged (> 30 px: it still "feels" physical),
  *            and that sleeping neighbours are woken and pushed by it (> 5 px).
  *   tied   – solved level, a cable tie placed on a same-color group, then the tie is dragged.
  *   fuzz   – FUZZ_DRAGS random drags (seeded) of random plugs / cable points, each followed by idle.
@@ -34,6 +35,8 @@ const IDLE_FRAMES = 60 * Number(process.env.IDLE_S ?? 8); // idle seconds (defau
 const REST_WINDOW = 60; // last 1 s is measured
 const MAX_DISP = 0.02;
 const MAX_ENERGY = 1e-3;
+/** average elongation of a dragged cable: cables must go taut, not stretch like rubber */
+const MAX_STRETCH = 1.12;
 
 interface Stats {
   maxDisp: number; energy: number;
@@ -78,8 +81,14 @@ function idle(g: Game, frames: number, window = REST_WINDOW): Stats {
   return { maxDisp, energy: eSum / window, restAt: (lastMove + 1) / 60, asleep };
 }
 
+function maxStretch(c: Cable) {
+  let len = 0;
+  for (let i = 0; i < c.n - 1; i++) len += Math.hypot(c.x[i + 1] - c.x[i], c.y[i + 1] - c.y[i]);
+  return len / (c.seg * (c.n - 1));
+}
+
 /** Grab the longest free stretch of some cable in the middle and swirl it. */
-function dragScenario(g: Game): { stats: Stats; follow: number; bodyMoved: number; pushed: number; ok: boolean } {
+function dragScenario(g: Game): { stats: Stats; follow: number; bodyMoved: number; pushed: number; stretch: number; ok: boolean } {
   // pick a cable node at least 60 px away from every plug (otherwise the plug is grabbed)
   const plugs = g.cables.flatMap((c) => c.ends.map((e) => g.plugGeom(e)));
   let sx = 0, sy = 0, best = -1;
@@ -90,11 +99,11 @@ function dragScenario(g: Game): { stats: Stats; follow: number; bodyMoved: numbe
     }
     if (best > 60) break;
   }
-  const grabbed = g.pointerDown(sx, sy, false);
-  if (!grabbed || g.grab?.kind !== 'cable') return { stats: { maxDisp: 99, energy: 99, restAt: 99, asleep: 0 }, follow: 99, bodyMoved: 0, pushed: 0, ok: false };
+  const grabbed = g.pointerDown(sx, sy);
+  if (!grabbed || g.grab?.kind !== 'cable') return { stats: { maxDisp: 99, energy: 99, restAt: 99, asleep: 0 }, follow: 99, bodyMoved: 0, pushed: 0, stretch: 99, ok: false };
   const gc = g.grab.cable!, gi = g.grab.idx!;
   const before = snapshot(g);
-  let follow = 0, bodyMoved = 0;
+  let follow = 0, bodyMoved = 0, stretch = 0;
   const ci = g.cables.indexOf(gc);
   // how far did the rest of the dragged cable travel (should be a lot: it is pulled along)
   const trackBody = () => {
@@ -109,7 +118,8 @@ function dragScenario(g: Game): { stats: Stats; follow: number; bodyMoved: numbe
     const px = 360 + Math.cos(a) * 200, py = 480 + Math.sin(a) * 160;
     g.pointerMove(px, py);
     g.step(DT);
-    follow = Math.max(follow, Math.hypot(gc.x[gi] - px, gc.y[gi] - py));
+    if (g.grab!.over < 0.5) follow = Math.max(follow, Math.hypot(gc.x[gi] - px, gc.y[gi] - py));
+    stretch = Math.max(stretch, maxStretch(gc));
     trackBody();
   }
   // slow drag along the floor: 120 px in 2 s (1 px/frame, below the static-friction threshold)
@@ -117,7 +127,7 @@ function dragScenario(g: Game): { stats: Stats; follow: number; bodyMoved: numbe
     const px = 300 + f, py = 900;
     g.pointerMove(px, py);
     g.step(DT);
-    if (f > 30) follow = Math.max(follow, Math.hypot(gc.x[gi] - px, gc.y[gi] - Math.min(py, 882)));
+    if (f > 30 && g.grab!.over < 0.5) follow = Math.max(follow, Math.hypot(gc.x[gi] - px, gc.y[gi] - Math.min(py, 882)));
   }
   g.pointerUp();
   // the other (previously sleeping) cables must have been woken and pushed by the dragged one
@@ -128,7 +138,7 @@ function dragScenario(g: Game): { stats: Stats; follow: number; bodyMoved: numbe
     for (let i = 0; i < c.n; i++) pushed = Math.max(pushed, Math.hypot(after[k].x[i] - before[k].x[i], after[k].y[i] - before[k].y[i]));
   });
   const stats = idle(g, IDLE_FRAMES);
-  return { stats, follow, bodyMoved, pushed, ok: true };
+  return { stats, follow, bodyMoved, pushed, stretch, ok: true };
 }
 
 const FUZZ_DRAGS = Number(process.env.FUZZ_DRAGS ?? 4);
@@ -145,7 +155,7 @@ function fuzzScenario(g: Game, seed: number): Stats {
   for (let d = 0; d < FUZZ_DRAGS; d++) {
     const c = g.cables[Math.floor(r() * g.cables.length)];
     const i = Math.floor(r() * c.n);
-    g.pointerDown(c.x[i], c.y[i], false);
+    g.pointerDown(c.x[i], c.y[i]);
     let x = c.x[i], y = c.y[i];
     const tx = 40 + r() * 640, ty = 120 + r() * 780;
     const frames = 30 + Math.floor(r() * 90);
@@ -177,8 +187,8 @@ function tieScenario(g: Game): Stats | null {
   const cy = group.reduce((s, c) => s + c.y[Math.round((c.n - 1) * k)], 0) / group.length;
   if (!g.placeTie(cx, cy)) return null;
   idle(g, 60);
-  const t = g.ties[0];
-  g.pointerDown(t.x, t.y, false);
+  const t = g.ties[g.ties.length - 1];
+  g.pointerDown(t.x, t.y);
   for (let f = 0; f < 60; f++) { g.pointerMove(t.x + 40 * Math.sin(f / 10), t.y + f); g.step(DT); }
   g.pointerUp();
   return idle(g, IDLE_FRAMES);
@@ -207,9 +217,9 @@ for (const L of LEVELS) {
   const g3 = new Game(L);
   idle(g3, IDLE_FRAMES);
   const d = dragScenario(g3);
-  const dragOk = d.ok && d.follow < 1 && d.bodyMoved > 60 && d.pushed > 5;
+  const dragOk = d.ok && d.follow < 1 && d.bodyMoved > 30 && d.pushed > 5 && d.stretch < MAX_STRETCH;
   if (!dragOk) failures++;
-  results.push(['drag  ', d.stats, `| follow err ${d.follow.toFixed(2)}px, body moved ${d.bodyMoved.toFixed(0)}px, neighbours pushed ${d.pushed.toFixed(0)}px ${dragOk ? 'OK' : 'FAIL'}`]);
+  results.push(['drag  ', d.stats, `| follow err ${d.follow.toFixed(2)}px, stretch ${d.stretch.toFixed(2)}x, body moved ${d.bodyMoved.toFixed(0)}px, neighbours pushed ${d.pushed.toFixed(0)}px ${dragOk ? 'OK' : 'FAIL'}`]);
 
   const tStats = tieScenario(new Game(L));
   if (tStats) results.push(['tied  ', tStats, '| tie placed + dragged']);

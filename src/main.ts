@@ -1,6 +1,7 @@
 import './style.css';
 import { Game, W, H, Evaluation, GameEvent } from './game';
 import { LEVELS, COLORS, type ColorKey } from './levels';
+import { ALL_TOOLS, TOOLS, UNLIMITED, type ToolId } from './tools';
 import { badgeSvg } from './symbols';
 import { drawScene } from './render';
 import * as sfx from './audio';
@@ -10,7 +11,7 @@ const cv = $<HTMLCanvasElement>('cv');
 const ctx = cv.getContext('2d')!;
 const stage = $('stage');
 const overlay = $('overlay');
-const btnTie = $<HTMLButtonElement>('btn-tie');
+const tray = $('tray');
 const btnFinish = $<HTMLButtonElement>('btn-finish');
 const btnSound = $<HTMLButtonElement>('btn-sound');
 
@@ -20,7 +21,12 @@ const STAR = '<svg viewBox="0 0 24 24"><path d="M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.
 
 let game: Game | null = null;
 let levelIdx = 0;
-let tieMode = false;
+let tool: ToolId = 'hand';
+/** correct plugs in a row: the chime climbs a scale */
+let combo = 0;
+/** a tap-tool press in progress: becomes a tool use unless it turns into a drag */
+let pressed: { x: number; y: number; t: number } | null = null;
+let doneTasks = new Set<string>();
 let paused = true;
 let beforeShot = '';
 let scale = 1, offX = 0, offY = 0, dpr = 1;
@@ -28,10 +34,21 @@ let pointerId: number | null = null;
 let hintTimer = 0;
 let toastTimer = 0;
 
-const stars: number[] = (() => {
-  try { return JSON.parse(localStorage.getItem('cablecalm.stars') || '[]'); } catch { return []; }
+/** stars by level key (older saves were a plain array of the first five jobs) */
+const saved: Record<string, number> = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem('cablecalm.stars') || '{}');
+    if (!Array.isArray(v)) return v ?? {};
+    const old = ['rosa', 'cafe', 'panel', 'pixel', 'cloud'];
+    return Object.fromEntries(v.map((n, i) => [old[i], n]).filter(([k, n]) => k && n));
+  } catch { return {}; }
 })();
-const saveStars = () => localStorage.setItem('cablecalm.stars', JSON.stringify(stars));
+const starsOf = (i: number) => saved[LEVELS[i].key] ?? 0;
+/** review shortcut: add ?all to the URL to open every job */
+const openAll = new URLSearchParams(location.search).has('all');
+/** a job is open if it is the first, was already done, or the one before it is done */
+const unlocked = (i: number) => openAll || i === 0 || starsOf(i) > 0 || starsOf(i - 1) > 0;
+const saveStars = () => localStorage.setItem('cablecalm.stars', JSON.stringify(saved));
 
 // ---------------------------------------------------------------- layout
 function resize() {
@@ -67,10 +84,38 @@ function hint(text: string, ms = 6000) {
   hintTimer = window.setTimeout(() => h.classList.remove('show'), ms);
 }
 
-function setTieMode(on: boolean) {
-  tieMode = on && !!game && game.tiesLeft > 0;
-  btnTie.classList.toggle('active', tieMode);
-  if (tieMode) hint('Tap where 2+ same-color cables run close together to zip them into a bundle.', 4000);
+function setTool(t: ToolId, quiet = false) {
+  if (!game) t = 'hand';
+  else if (t !== 'hand' && !game.level.tools[t]) return;
+  if (tool !== t && game) game.cancelGrab();
+  sfx.airOff();
+  tool = t;
+  tray.querySelectorAll<HTMLButtonElement>('.ttool').forEach((b) => {
+    b.classList.toggle('active', b.dataset.t === t);
+    b.setAttribute('aria-pressed', String(b.dataset.t === t));
+  });
+  if (!quiet && t !== 'hand') hint(TOOLS[t].hint, 4500);
+  else if (!quiet) $('hint').classList.remove('show');
+  updateCursor();
+}
+
+function levelTools(): ToolId[] {
+  return game ? ALL_TOOLS.filter((t) => t === 'hand' || game!.level.tools[t]) : [];
+}
+
+function buildTray() {
+  tray.innerHTML = levelTools().map((t, i) => `
+    <button class="ttool" data-t="${t}" title="${TOOLS[t].name} (${i + 1})" aria-label="${TOOLS[t].name}">
+      ${TOOLS[t].icon}<span>${TOOLS[t].name}</span><b class="n" hidden></b>
+    </button>`).join('');
+  tray.querySelectorAll<HTMLButtonElement>('.ttool').forEach((b) => {
+    b.onclick = () => {
+      if (!game || paused || game.power >= 0) return;
+      sfx.unlockAudio(); sfx.sfxUi();
+      const t = b.dataset.t as ToolId;
+      setTool(tool === t ? 'hand' : t);
+    };
+  });
 }
 
 function updateHud() {
@@ -80,14 +125,32 @@ function updateHud() {
   conn.textContent = `${n}/${t}`;
   conn.title = n === t ? 'All connections working' : 'Some connections not working yet';
   conn.classList.toggle('ok', n === t);
-  $('tie-count').textContent = String(game.tiesLeft);
-  btnFinish.disabled = !game.allGood;
+  tray.querySelectorAll<HTMLButtonElement>('.ttool').forEach((b) => {
+    const k = b.dataset.t as ToolId, left = game!.left[k], el = b.querySelector<HTMLElement>('.n')!;
+    el.hidden = k === 'hand' || left >= UNLIMITED;
+    el.textContent = String(left);
+    b.classList.toggle('empty', k !== 'hand' && left <= 0);
+  });
+  btnFinish.disabled = !game.allGood || game.power >= 0;
 }
 
 function updateMeter() {
   if (!game) return;
   const ev = game.evaluate();
   $('meter-fill').style.width = `${ev.score}%`;
+  const box = $('tasks');
+  const list = [...ev.tasks.slice(0, 1), { id: 'cross', label: 'Crossings', done: ev.crossings ? 0 : 1, total: 1 }, ...ev.tasks.slice(1)];
+  // keep the chips in place and only touch what changed, so the tick animation plays once
+  for (const t of list) {
+    let el = box.querySelector<HTMLElement>(`[data-id="${t.id}"]`);
+    if (!el) { el = document.createElement('div'); el.className = 'task'; el.dataset.id = t.id; box.append(el); }
+    const ok = t.done >= t.total && (t.id !== 'cross' || game.allGood);
+    const text = t.id === 'cross' ? `Crossings ${ev.crossings}` : t.id === 'dust' ? `${t.label} ${Math.floor((t.done / t.total) * 100)}%` : `${t.label} ${Math.floor(t.done)}/${t.total}`;
+    if (el.textContent !== text) el.textContent = text;
+    el.classList.toggle('ok', ok);
+    if (ok) doneTasks.add(t.id); else doneTasks.delete(t.id);
+  }
+  box.querySelectorAll<HTMLElement>('.task').forEach((el) => { if (!list.some((t) => t.id === el.dataset.id)) el.remove(); });
 }
 
 function starsHtml(n: number) {
@@ -107,7 +170,7 @@ function hideOverlay() {
 
 // ---------------------------------------------------------------- screens
 function titleScreen() {
-  game = null;
+  game = null; buildTray(); $('tasks').innerHTML = '';
   showOverlay(`
     <div class="card title-card">
       <svg class="logo-cables" viewBox="0 0 300 90">
@@ -118,20 +181,20 @@ function titleScreen() {
       <div class="logo"><span>Cable</span> <span>Calm</span></div>
       <p class="tagline">Untangle. Click. Zip. Breathe.<br/>A cozy job simulator for cable tidiers.</p>
       <div class="row"><button class="btn green" id="go-play">Play</button></div>
-      <p style="font-size:12px;opacity:.55;margin-top:14px">Drag plugs into matching ports · tie same colors · light every LED</p>
+      <p style="font-size:12px;opacity:.55;margin-top:14px">Plug · comb · wind · wrap · zip · label · power on</p>
       <p class="a11y-note">Colorblind-friendly: every color also has its own symbol ${(Object.keys(COLORS) as ColorKey[]).map((k) => badgeSvg(k, 18)).join('')}</p>
     </div>`);
   $('go-play').onclick = () => { sfx.unlockAudio(); sfx.sfxUi(); levelSelect(); };
 }
 
 function levelSelect() {
-  game = null;
+  game = null; buildTray(); $('tasks').innerHTML = '';
   const items = LEVELS.map((l, i) => {
-    const locked = i > 0 && !(stars[i - 1] > 0);
+    const locked = !unlocked(i);
     return `<button class="lvl" data-i="${i}" ${locked ? 'disabled' : ''}>
       <div class="num">${locked ? '🔒' : l.id}</div>
       <div class="info"><div class="t">${l.title}</div><div class="s">${l.tier} · ${l.client}</div></div>
-      <div class="stars">${starsHtml(stars[i] ?? 0)}</div>
+      <div class="stars">${starsHtml(starsOf(i))}</div>
     </button>`;
   }).join('');
   showOverlay(`<div class="card"><h2>Job board</h2><p style="opacity:.7">Pick a job. Earn stars to unlock the next client.</p><div class="levels">${items}</div></div>`);
@@ -146,7 +209,10 @@ function startLevel(i: number) {
   game = new Game(L);
   game.onEvent = onGameEvent;
   beforeShot = snapshot(game);
-  setTieMode(false);
+  combo = 0; doneTasks = new Set(); pressed = null; pointerId = null;
+  $('tasks').innerHTML = '';
+  buildTray();
+  setTool('hand', true);
   $('lvl-name').textContent = `${L.id}. ${L.title}`;
   $('lvl-sub').textContent = `${L.tier} · client: ${L.client}`;
   updateHud(); updateMeter();
@@ -159,6 +225,7 @@ function startLevel(i: number) {
         <div class="bubble"><div class="who">${L.client}</div><div class="role">${L.clientRole}</div>${L.message}</div>
       </div>
       <ul class="goals">${L.goals.map((g) => `<li>${g}</li>`).join('')}</ul>
+      ${(L.newTools ?? []).map((t) => `<div class="newtool"><div class="ic">${TOOLS[t].icon}</div><div><b>New: ${TOOLS[t].name}.</b> ${TOOLS[t].about}</div></div>`).join('')}
       ${legendHtml(L.ports.map((p) => p.color))}
       <div class="row"><button class="btn alt" id="b-back">Job board</button><button class="btn green" id="b-start">Start job</button></div>
     </div>`);
@@ -167,8 +234,7 @@ function startLevel(i: number) {
     sfx.unlockAudio(); sfx.sfxUi();
     hideOverlay();
     hint(L.tip, 7000);
-    if (L.ties > 0 && i === 1) btnTie.classList.add('flash');
-    setTimeout(() => btnTie.classList.remove('flash'), 3000);
+    for (const t of L.newTools ?? []) tray.querySelector(`[data-t="${t}"]`)?.classList.add('flash');
   };
 }
 
@@ -187,18 +253,18 @@ function snapshot(g: Game): string {
   c.width = W * k; c.height = H * k;
   const x = c.getContext('2d')!;
   x.scale(k, k);
-  drawScene(x, g, { ui: false, tieMode: false });
+  drawScene(x, g, { ui: false, tool: 'hand' });
   return c.toDataURL('image/jpeg', 0.85);
 }
 
 function finishLevel() {
+  const L = LEVELS[levelIdx];
   if (!game || !game.allGood) return;
-  setTieMode(false);
+  setTool('hand', true);
   const ev: Evaluation = game.evaluate();
   const after = snapshot(game);
-  stars[levelIdx] = Math.max(stars[levelIdx] ?? 0, ev.stars);
+  saved[L.key] = Math.max(saved[L.key] ?? 0, ev.stars);
   saveStars();
-  const L = LEVELS[levelIdx];
   const hasNext = levelIdx < LEVELS.length - 1;
   const line = ev.stars === 3 ? `"${L.client}: It's... beautiful. I'm framing this."`
     : ev.stars === 2 ? `"${L.client}: Everything works and it looks great. Thank you!"`
@@ -214,6 +280,7 @@ function finishLevel() {
         <li>Crossings<b>${ev.crossings === 0 ? 'None ✓' : ev.crossings}</b></li>
         <li>Smooth runs<b>${Math.round(ev.smooth * 100)}%</b></li>
         <li>Color bundles<b>${ev.bundleGroups ? `${ev.bundled}/${ev.bundleGroups}` : '—'}</b></li>
+        <li>Finishing touches<b>${Math.round(ev.finish * 100)}%</b></li>
       </ul>
       <div class="compare" id="cmp">
         <img class="after" src="${after}" alt="After"/>
@@ -265,7 +332,7 @@ function finishLevel() {
 }
 
 function endScreen() {
-  const total = stars.reduce((a, b) => a + (b || 0), 0);
+  const total = LEVELS.reduce((a, _, i) => a + starsOf(i), 0);
   showOverlay(`<div class="card title-card">
     <div class="logo"><span>All</span> <span>tidy!</span></div>
     <p class="tagline">You finished every job in the prototype.<br/>Stars collected: <b>${total}/${LEVELS.length * 3}</b></p>
@@ -275,22 +342,54 @@ function endScreen() {
   $('b-board2').onclick = () => { sfx.sfxUi(); levelSelect(); };
 }
 
+function flash() {
+  const f = $('flash');
+  f.classList.remove('go'); void f.offsetWidth; f.classList.add('go');
+}
+
 // ---------------------------------------------------------------- events
 function onGameEvent(e: GameEvent) {
   switch (e.type) {
     case 'snap':
-      sfx.sfxSnap(e.colorMatch, e.cableDone);
+      combo = e.cableDone ? combo + 1 : e.colorMatch ? combo : 0;
+      sfx.sfxSnap(e.colorMatch, e.cableDone, Math.max(0, combo - 1));
       sfx.buzz(e.colorMatch ? (e.cableDone ? [18, 40, 25] : 18) : [10, 30, 10]);
       if (!e.colorMatch) toast('Wrong port! Its LED shows ✕ — match the color and symbol.');
       break;
-    case 'unplug': sfx.sfxUnplug(); sfx.buzz(8); break;
+    case 'unplug': sfx.sfxUnplug(); sfx.buzz(12); break;
+    case 'eject': sfx.sfxPop(); break;
+    case 'magnet': sfx.sfxMagnet(); sfx.buzz(4); break;
     case 'grab': sfx.sfxGrab(); break;
-    case 'tie': sfx.sfxZip(); sfx.buzz([6, 20, 6, 20, 6, 20, 14]); setTieMode(false); break;
-    case 'snip': sfx.sfxSnip(); sfx.buzz(10); toast('Tie removed'); break;
+    case 'strain': sfx.sfxStrain(); sfx.buzz(15); break;
+    case 'tie': sfx.sfxZip(); sfx.buzz([6, 20, 6, 20, 6, 20, 14]); break;
+    case 'trim': sfx.sfxTrim(); sfx.buzz([8, 20, 14]); break;
+    case 'snip': sfx.sfxSnip(); sfx.buzz(10); break;
+    case 'velcro': sfx.sfxVelcro(); sfx.buzz([8, 10, 8, 10, 20]); break;
+    case 'rip': sfx.sfxRip(); sfx.buzz([5, 10, 5, 10, 5, 10, 5]); break;
+    case 'reel': sfx.sfxHook(); sfx.buzz(14); hint('Press and hold the reel to wind up the slack. Tap it to let the cable out.', 4500); break;
+    case 'wind': sfx.sfxWind(e.k); sfx.buzz(4); break;
+    case 'windTight': sfx.sfxWindTight(); sfx.buzz([20, 30, 30]); break;
+    case 'unspool': sfx.sfxUnspool(); sfx.buzz([4, 12, 4, 12, 4]); break;
+    case 'payout': sfx.sfxPayout(); break;
+    case 'comb': sfx.sfxComb(e.n); sfx.buzz(5); break;
+    case 'wrap': sfx.sfxWrap(e.n); sfx.buzz(5); break;
+    case 'combDone': case 'wrapDone': sfx.sfxDone(); sfx.buzz([12, 30, 20]); break;
+    case 'label': sfx.sfxPrint(); sfx.buzz([4, 20, 4, 20, 4, 20, 14]); break;
+    case 'dust': sfx.sfxDust(); break;
+    case 'dustDone': sfx.sfxDone(); sfx.buzz([12, 30, 20]); toast('Spotless!'); break;
+    case 'screw': sfx.sfxScrew(e.k); sfx.buzz(5); break;
+    case 'screwDone': sfx.sfxScrewDone(); sfx.buzz(22); break;
+    case 'hook': sfx.sfxHook(); sfx.buzz(14); break;
+    case 'unhook': sfx.sfxUnplug(); break;
+    case 'lid': sfx.sfxLid(e.k); sfx.buzz(9); return;
+    case 'lidDone': sfx.sfxDone(); sfx.buzz([25, 20, 35]); break;
+    case 'lidOpen': sfx.sfxUnplug(); sfx.buzz(10); break;
+    case 'pulse': sfx.sfxPulse(e.i); sfx.buzz(10); break;
+    case 'powered': sfx.sfxAllGood(); sfx.buzz([30, 60, 60]); flash(); setTimeout(finishLevel, 900); break;
     case 'allgood':
-      setTimeout(() => sfx.sfxAllGood(), 250);
-      sfx.buzz([30, 60, 30, 60, 60]);
-      hint('Everything works! Tidy up with ties & smooth runs, then press “Finish job”.', 5000);
+      setTimeout(() => sfx.sfxDone(), 250);
+      sfx.buzz([30, 60, 30]);
+      hint('Everything is connected! Tidy up, then press “Power on”.', 5000);
       break;
     case 'broken': break;
     case 'toast': sfx.sfxError(); toast(e.text); break;
@@ -299,59 +398,87 @@ function onGameEvent(e: GameEvent) {
 }
 
 // ---------------------------------------------------------------- input
+/** Plug grab radius in world px: at least a fingertip on touch, comfortable with a mouse. */
+const grabRadius = (e: PointerEvent) => Math.min(64, Math.max(44, (e.pointerType === 'touch' ? 30 : 22) / scale));
+
+function updateCursor() {
+  if (!game || paused) { cv.style.cursor = 'default'; return; }
+  if (game.grab) cv.style.cursor = tool === 'hand' || TOOLS[tool].mode === 'tap' ? 'grabbing' : 'none';
+  else if (tool === 'hand') cv.style.cursor = game.hover ? (game.hover.kind === 'tie' || game.hover.kind === 'reel' ? 'pointer' : 'grab') : 'default';
+  else cv.style.cursor = tool === 'air' || tool === 'comb' ? 'none' : 'crosshair';
+}
+
 cv.addEventListener('pointerdown', (e) => {
-  if (!game || paused) return;
-  if (pointerId !== null) return;
+  if (!game || paused || game.power >= 0) return;
+  if (pointerId !== null || e.button > 0) return;
   sfx.unlockAudio();
   const p = toWorld(e);
-  const wasTie = tieMode;
-  const grabbed = game.pointerDown(p.x, p.y, tieMode);
-  if (wasTie) { updateHud(); return; }
-  if (grabbed) { pointerId = e.pointerId; cv.setPointerCapture(e.pointerId); }
+  const mode = TOOLS[tool].mode;
+  const opts = { r: grabRadius(e), touch: e.pointerType === 'touch' };
+  const grabbed = game.pointerDown(p.x, p.y, mode === 'stroke' ? tool : 'hand', opts);
+  if (mode === 'tap') pressed = { x: p.x, y: p.y, t: performance.now() };
+  if (grabbed || pressed) { pointerId = e.pointerId; cv.setPointerCapture(e.pointerId); }
+  if (game.grab?.kind === 'air') sfx.airOn();
+  updateCursor();
   e.preventDefault();
 });
 cv.addEventListener('pointermove', (e) => {
   if (!game) return;
   if (pointerId !== null && e.pointerId !== pointerId) return;
   const p = toWorld(e);
-  game.pointerMove(p.x, p.y);
+  if (pressed && Math.hypot(p.x - pressed.x, p.y - pressed.y) > 10) pressed = null; // it was a drag after all
+  game.pointerMove(p.x, p.y, grabRadius(e));
+  updateCursor();
 });
 const up = (e: PointerEvent) => {
   if (!game || e.pointerId !== pointerId) return;
   pointerId = null;
-  game.pointerUp();
-  updateHud();
+  sfx.airOff();
+  const k = game.grab?.kind;
+  const fixture = k === 'tie' || k === 'reel' || k === 'lid';
+  if (pressed && performance.now() - pressed.t < 450 && !fixture) {
+    game.cancelGrab();
+    if (e.type === 'pointerup') game.useTool(tool, pressed.x, pressed.y);
+  } else game.pointerUp();
+  pressed = null;
+  // out of uses: fall back to the hand
+  if (tool !== 'hand' && game.left[tool] <= 0) setTool('hand', true);
+  updateHud(); updateMeter(); updateCursor();
 };
 cv.addEventListener('pointerup', up);
 cv.addEventListener('pointercancel', up);
-cv.addEventListener('pointerleave', () => { if (game && pointerId === null) game.pointer = { x: -999, y: -999 }; });
+cv.addEventListener('pointerleave', () => { if (game && pointerId === null) { game.pointer = { x: -999, y: -999 }; game.hover = null; } });
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 
-btnTie.onclick = () => {
-  if (!game || paused) return;
+btnFinish.onclick = () => {
+  if (!game || paused || !game.allGood || game.power >= 0) return;
   sfx.unlockAudio();
-  if (game.tiesLeft <= 0) { sfx.sfxError(); toast('No ties left — tap a placed tie to remove it.'); return; }
-  sfx.sfxUi();
-  setTieMode(!tieMode);
+  setTool('hand', true);
+  sfx.sfxLever(); sfx.buzz(60);
+  game.powerOn();
+  updateHud();
 };
-btnFinish.onclick = () => { sfx.sfxUi(); finishLevel(); };
 $('btn-reset').onclick = () => { if (!game) return; sfx.sfxUi(); startLevel(levelIdx); };
-$('btn-menu').onclick = () => { sfx.unlockAudio(); sfx.sfxUi(); setTieMode(false); levelSelect(); };
+$('btn-menu').onclick = () => { sfx.unlockAudio(); sfx.sfxUi(); setTool('hand', true); levelSelect(); };
 const refreshSound = () => { btnSound.innerHTML = sfx.isMuted() ? SOUND_OFF : SOUND_ON; };
 btnSound.onclick = () => { sfx.unlockAudio(); sfx.setMuted(!sfx.isMuted()); refreshSound(); };
 refreshSound();
 window.addEventListener('keydown', (e) => {
-  if (e.key === 't' || e.key === 'T') btnTie.click();
-  if (e.key === 'Escape') setTieMode(false);
+  if (!game || paused || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'Escape') setTool('hand');
+  const n = Number(e.key);
+  if (n >= 1 && n <= levelTools().length) { sfx.sfxUi(); setTool(levelTools()[n - 1]); }
 });
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
 let acc = 0;
 let frame = 0;
+let fps = 60;
 function loop(now: number) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
+  if (dt > 0) fps += (1 / dt - fps) * 0.05;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#141a26';
   ctx.fillRect(0, 0, cv.width, cv.height);
@@ -366,7 +493,9 @@ function loop(now: number) {
     ctx.setTransform(scale * dpr, 0, 0, scale * dpr, offX * dpr, offY * dpr);
     ctx.save();
     ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
-    drawScene(ctx, game, { ui: !paused, tieMode });
+    const draw = () => drawScene(ctx, game!, { ui: !paused, tool });
+    // on fast displays blend between physics steps so motion is as smooth as the screen allows
+    if (fps > 75 && !paused) game.interpolated(Math.min(1, acc * 60), draw); else draw();
     ctx.restore();
   }
   requestAnimationFrame(loop);

@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test:physics": "node scripts/run-ts.mjs tests/physics.test.ts",
+    "test:tools": "node scripts/run-ts.mjs tests/tools.test.ts",
     "test:colors": "node scripts/run-ts.mjs tests/colors.test.ts"
   },
   "devDependencies": {
